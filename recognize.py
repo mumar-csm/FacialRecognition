@@ -1,0 +1,1 @@
+"""webcam/image recognition using a trained model"""

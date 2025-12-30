@@ -1,0 +1,1 @@
+"""Builds face encodings from a directory of images (Dropbox folder)"""

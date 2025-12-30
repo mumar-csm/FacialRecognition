@@ -1,0 +1,37 @@
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+*.dll
+*.dylib
+
+# ---- Virtual Environments ----
+venv/
+env/
+.face_recognition_env/
+face_recognition_env/
+*/Scripts/
+*/Lib/
+
+# ---- Logs / Dumps ----
+*.log
+*.pid
+
+# ---- IDE / Editors ----
+.vscode/
+.idea/
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
+
+# ---- Build / Dist ----
+build/
+dist/
+*.egg-info/
+
+# ---- Jupyter ----
+.ipynb_checkpoints/
+
+# ---- Images /
