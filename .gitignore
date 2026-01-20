@@ -20,6 +20,27 @@ face_recognition_env/
 # Ignore logs folder
 logs/
 
+# Ignore debug_scripts folder
+debug_scripts/
+
+# ---- Sensitive Data / Models ----
+# Face database (contains biometric data)
+data/known_faces.pkl
+data/*.pkl
+
+# Haar Cascade model (large file, available from OpenCV)
+data/haarcascade_frontalface_default.xml
+
+# Debug/test scripts (temporary troubleshooting files)
+debug_image.py
+test_script.py
+test_encoding.py
+check_dlib.py
+test_dlib_raw.py
+verify_database.py
+verify_db_simple.py
+inspect_pkl.py
+
 # ---- Logs / Dumps ----
 *.log
 *.pid
