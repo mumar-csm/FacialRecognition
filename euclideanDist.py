@@ -87,11 +87,13 @@ def pretty_print_result(title: str, result: dict):
     print(f"Threshold (Euclidean): {result['threshold_used']:.3f}")
     print(f"Same identity (Euclidean decision)? {'YES' if result['same_identity_by_euclidean'] else 'NO'}")
 
-# ----------------------------
-# Run comparisons
-# ----------------------------
-res1 = compare_embeddings(embedding1, embedding2, normalize=USE_L2_NORMALIZATION, threshold=EUCLIDEAN_THRESHOLD)
-res2 = compare_embeddings(embedding1, embedding3, normalize=USE_L2_NORMALIZATION, threshold=EUCLIDEAN_THRESHOLD)
 
-pretty_print_result("Face A vs Slightly Perturbed Face A", res1)
-pretty_print_result("Face A vs Different Face", res2)
+if __name__ == "__main__":
+    # ----------------------------
+    # Run comparisons
+    # ----------------------------
+    res1 = compare_embeddings(embedding1, embedding2, normalize=USE_L2_NORMALIZATION, threshold=EUCLIDEAN_THRESHOLD)
+    res2 = compare_embeddings(embedding1, embedding3, normalize=USE_L2_NORMALIZATION, threshold=EUCLIDEAN_THRESHOLD)
+
+    pretty_print_result("Face A vs Slightly Perturbed Face A", res1)
+    pretty_print_result("Face A vs Different Face", res2)

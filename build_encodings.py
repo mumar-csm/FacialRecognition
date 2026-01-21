@@ -130,38 +130,6 @@ def discover_images(root_dir: str) -> List[ImageRecord]:
     return sorted(results, key=lambda r: (r.employee_id.lower(), r.image_path.lower()))
 
 
-# def validate_and_load(image_path:str) -> Any:
-#     """
-#     Safely load an image from disk and ensure:
-#        - it's readable
-#        - 8-bit RGB (convert if needed)
-#        - Reasonable dimensions (e.g, > 100x100)
-#     Return a numpy ndarray or raise/return None on failure.
-#     """
-#     img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-#     if img_bgr is None:
-#         print(f"[ERROR] Failed to read image: {image_path}")
-#         return None
-    
-#     # Convert BGR -> RGB
-#     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-#     # Ensure Uint8
-#     if img_rgb.dtype != np.uint8:
-#         try:
-#             img_rgb = img_rgb.astype(np.uint8)
-#         except Exception as e:
-#             print(f"[ERROR] Failed to convert image to uint8: {image_path} ({e})")
-#             return None
-    
-#     h,w = img_rgb.shape[:2]
-#     if h < 100 or w < 100:
-#         print(f"[ERROR] Image too small (<100x100): {image_path} ({w}x{h})")
-#         return None
-    
-#     return img_rgb
-
-
 
 def validate_and_load(image_path: str) -> Any:
     """
