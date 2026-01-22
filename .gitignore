@@ -63,3 +63,7 @@ dist/
 
 # ---- Images /
 encoded_faces/
+
+
+# ----- Junk files -----
+tmpclaude-*
