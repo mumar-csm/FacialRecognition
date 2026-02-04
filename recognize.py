@@ -235,8 +235,8 @@ def draw_annotations(frame: np.ndarray, detections: List[Detection], fps: Option
     for det in detections:
         x, y, w, h = det.bbox
 
-        # Color: green for known, yellow for unknown
-        color = (0, 255, 0) if det.label != "Unknown" else (0, 255, 255)
+        # Color: green for known, red for unknown
+        color = (0, 255, 0) if det.label != "Unknown" else (0, 0, 255)
 
         # Draw bounding box
         cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
