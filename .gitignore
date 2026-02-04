@@ -62,3 +62,8 @@ dist/
 .ipynb_checkpoints/
 
 # ---- Images /
+encoded_faces/
+
+
+# ----- Junk files -----
+tmpclaude-*

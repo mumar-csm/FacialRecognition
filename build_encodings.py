@@ -77,39 +77,6 @@ def load_config() -> Dict[str, Any]:
 
 # Discovery & I/O
 
-# def discover_images(root_dir: str) -> List[ImageRecord]:
-    """
-    Recursively discover .jpg/.jpeg/.png images under root_dir.
-    Derive employee_id from filename or parent folder (final decision TBD).
-    """
-    exts = {".jpg", ".jpeg", ".png"}
-    results: List[ImageRecord] = []
-
-    print(f"[DEBUG] root_dir repr: {repr(root_dir)}")
-    print(f"[DEBUG] is_dir: {os.path.is_dir(root_dir)}")
-    try:
-        entries = os.listdir(root_dir)
-        print(f"[DEBUG] listdir count: {len(entries)}")
-        print(f"[DEBUG] first 5 entries: {entries[:5]}")
-    except Exception as e:
-        print(f"[ERROR] listdir error: {e}")
-
-    for dirpath, _, filenames in os.walk(root_dir):
-        for fn in filenames:
-            ext = os.path.splitext(fn)[1].lower()
-            if ext in exts:
-                path = os.path.join(dirpath, fn)
-                employee_id = os.path.splitext(os.path.basename(fn))[0]
-                results.append(ImageRecord(employee_id=employee_id, image_path=path))
-
-    
-    print(f"[DEBUG] discover_images found {len(results)} images under '{root_dir}'")
-    for r in results[:5]:
-        print(f"[DEBUG] sample: {r.image_path}")
-
-    return sorted(results, key=lambda r: (r.employee_id.lower(), r.image_path.lower()))
-
-
 from pathlib import Path
 
 def discover_images(root_dir: str) -> List[ImageRecord]:
@@ -130,46 +97,18 @@ def discover_images(root_dir: str) -> List[ImageRecord]:
     return sorted(results, key=lambda r: (r.employee_id.lower(), r.image_path.lower()))
 
 
-# def validate_and_load(image_path:str) -> Any:
-#     """
-#     Safely load an image from disk and ensure:
-#        - it's readable
-#        - 8-bit RGB (convert if needed)
-#        - Reasonable dimensions (e.g, > 100x100)
-#     Return a numpy ndarray or raise/return None on failure.
-#     """
-#     img_bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-#     if img_bgr is None:
-#         print(f"[ERROR] Failed to read image: {image_path}")
-#         return None
-    
-#     # Convert BGR -> RGB
-#     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-#     # Ensure Uint8
-#     if img_rgb.dtype != np.uint8:
-#         try:
-#             img_rgb = img_rgb.astype(np.uint8)
-#         except Exception as e:
-#             print(f"[ERROR] Failed to convert image to uint8: {image_path} ({e})")
-#             return None
-    
-#     h,w = img_rgb.shape[:2]
-#     if h < 100 or w < 100:
-#         print(f"[ERROR] Image too small (<100x100): {image_path} ({w}x{h})")
-#         return None
-    
-#     return img_rgb
-
-
 
 def validate_and_load(image_path: str) -> Any:
     """
     Safely load an image from disk and ensure:
-    - readable
-    - 8-bit RGB (properly handles RGBA PNGs with transparency)
-    - reasonable dimensions (> 100x100)
-    Returns a numpy ndarray or None on failure.
+    - Image Readability (returns None on failure)
+    - Format conversion (grayscale, RGBA, BGR -> RGB)
+    - Alpha compositing (transparent PNGs blended on white background)
+    - Data type normalization (uint8)
+    - Memory layout (C-contiguous array for dlib compatibililty)
+    - Dimension validation (minimum size 100x100)
+
+    Returns a numpy ndarray (uint8, C-contiguous) or None on failure.
 
     Uses OpenCV for loading to ensure dlib compatibility.
     """
@@ -229,9 +168,18 @@ def validate_and_load(image_path: str) -> Any:
 
 def preprocess_image(img: Any, max_long_edge: int = 1600) -> Any:
     """
-    Minimal preprocessing for MVP:
-       - Ensure RGB(if not already)
-       - Resize so the longer edge <= max_long_edge (preserving aspect ratio)
+    Downsize images to control memory and CPU usage during face detection.
+
+    Only resizes if longer dimension exceeds max_long_edge.
+    Preserves aspect ratio using INTER_AREA interpolation (highest quality for downsampling).
+
+    Args:
+    - img: RGB image (from validate_and_load)
+    - max_long_edge: max pixel size for longer dimension (default: 1600)
+
+    Returns:
+        Resized RBG image (original if already <= max_long_edge).
+        
     Skip advanced normalization for now.
     """
     
@@ -393,7 +341,6 @@ def merge_incremental(existing: EncodingsDB, new_Records: List[FaceRecord]) -> E
     labels = [r.label for r in merged_records]
     meta = [{"image_path": r.image_path, "box": r.box} for r in merged_records]
     return EncodingsDB(encodings=encs, labels=labels, meta=meta, version=existing.version)
-    pass
 
 # CLI wiring
 
@@ -412,7 +359,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-long-edge", type=int, default=1600, help="Resize cap for the longer image edge")
     parser.add_argument("--rebuild", action="store_true", help="Ignore any existing DB and rebuild from scratch")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    # Future: --incremental flag; for now, we’ll parse but not use it
     parser.add_argument("--incremental", action="store_true", help="(Future) Merge new images into existing DB")
     return parser.parse_args()
 
@@ -487,11 +433,6 @@ def cli_main() -> None:
             continue
 
         img_prep = preprocess_image(img, max_long_edge=max_long_edge)
-        
-        # # --- TEMP: sanity test encoder on full preprocessed image ---
-        # full_enc = face_recognition.face_encodings(img_prep)
-        # print(f"[DEBUG] full-image encoding count: {len(full_enc)}")
-        # # --- end temp ---
 
         boxes = detect_faces(img_prep, cascade_path, config["detector"])
 
@@ -500,15 +441,6 @@ def cli_main() -> None:
             if verbose:
                 print(f"[WARN] Expected exactly 1 face, found {len(boxes)}: {rec.image_path}")
             continue
-
-        # face_roi = crop_with_margin(img_prep, boxes[0], margin_pct=margin_pct)
-        # print(f"[DEBUG] crop ROI -> shape={face_roi.shape} dtype={face_roi.dtype} contiguous={face_roi.flags['C_CONTIGUOUS']}")
-        # encoding = compute_embedding(face_roi)
-        # if encoding is None:
-        #     skipped_encoding_fail += 1
-        #     if verbose:
-        #         print(f"[WARN] Encoding failed: {rec.image_path}")
-        #     continue
 
         
         # Convert Haar (x, y, w, h) -> face_recognition (top, right, bottom, left)
@@ -544,18 +476,6 @@ def cli_main() -> None:
             img_prep = img_prep.astype(np.uint8)
             img_prep = np.ascontiguousarray(img_prep)
             print(f"[DEBUG] normalized img_prep -> shape={img_prep.shape} dtype={img_prep.dtype} contiguous={img_prep.flags['C_CONTIGUOUS']}")
-
-        # Ask face_recognition to encode using the known location (no manual crop)
-        # encs = face_recognition.face_encodings(img_prep, known_face_locations=[fr_box])
-        # print(f"[DEBUG] encodings from known_face_locations: {len(encs)}")
-
-        # if not encs:
-        #     skipped_encoding_fail += 1
-        #     if verbose:
-        #         print(f"[WARN] Encoding failed (known_face_locations): {rec.image_path}")
-        #     continue
-
-        
         
         # --- Encode using known_face_locations (primary path) ---
         try:
