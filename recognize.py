@@ -400,6 +400,139 @@ def recognize_from_image(image_path: str,
     return detections
 
 
+def recognize_from_video(video_path: str,
+                        db_path: str,
+                        threshold: float = 1.0,
+                        cascade_path: str = "data/haarcascade_frontalface_default.xml",
+                        output_path: Optional[str] = None,
+                        frame_skip: int = 0,
+                        resize_width: int = 640) -> Dict[str, Any]:
+    """
+    Face recognition on video file
+
+    Args:
+        video_path: Path to input video file (.mp4, .avi, .mov)
+        db_path: Path to face database
+        threshold: Matching threshold
+        cascade_path: Path to Haar Cascade XML
+        output_path: Optional path to save annotated video
+        frame_skip: Skip frames (0=all, 1=every other, 2=every 3rd, etc.)
+        resize_width: Resize frame width for performance
+
+    Returns:
+        Dictionary with statistics:
+        - total_frames: Total frames processed
+        - faces_detected: Total faces detected across all frames
+        - unique_identities: Set of unique identities
+        - processing_time: Total processing time in seconds
+    """
+    # Load database
+    print("[INFO] Loading face database...")
+    known_encodings, labels = load_database(db_path)
+
+    # Open video
+    print(f"[INFO] Attempting to open video: {video_path}")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    print(f"[INFO] Video properties: {width}x{height} @ {fps:.1f} FPS, {total_frames} frames total")
+    print(f"[INFO] Frame skip: {frame_skip} (processing every {frame_skip + 1}th frame)")
+
+    # Create video writer if output requested
+    writer = None
+    if output_path:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use mp4v codec
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        if not writer.isOpened():
+            print(f"[WARN] Failed to create video writer for {output_path}")
+            writer = None
+        else:
+            print(f"[INFO] Will save annotated video to: {output_path}")
+
+    # Statistics
+    start_time = time.time()
+    frame_idx = 0
+    faces_detected = 0
+    unique_identities = set()
+
+    print("[INFO] Processing video...")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Frame skip logic
+            if frame_skip > 0 and frame_idx % (frame_skip + 1) != 0:
+                frame_idx += 1
+                continue
+
+            # Resize for performance
+            if resize_width and frame.shape[1] > resize_width:
+                scale = resize_width / frame.shape[1]
+                frame = cv2.resize(frame, (resize_width, int(frame.shape[0] * scale)))
+
+            # Convert BGR to RGB for face_recognition
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Process frame
+            detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+
+            # Update statistics
+            faces_detected += len(detections)
+            for det in detections:
+                if det.label != "Unknown":
+                    unique_identities.add(det.label)
+
+            # Draw annotations
+            annotated = draw_annotations(frame, detections)
+
+            # Write to output video if requested
+            if writer and annotated.shape[1] == width and annotated.shape[0] == height:
+                writer.write(annotated)
+
+            # Progress reporting every 30 frames
+            if (frame_idx + 1) % 30 == 0:
+                progress = (frame_idx + 1) / max(total_frames, 1) * 100
+                print(f"[INFO] Processing frame {frame_idx + 1}/{total_frames} ({progress:.1f}%)")
+
+            frame_idx += 1
+
+    finally:
+        cap.release()
+        if writer:
+            writer.release()
+
+    # Calculate elapsed time
+    elapsed_time = time.time() - start_time
+
+    # Print summary
+    print(f"\n[SUMMARY]")
+    print(f"  Total frames processed: {frame_idx}")
+    print(f"  Faces detected: {faces_detected}")
+    print(f"  Unique identities: {len(unique_identities)}")
+    print(f"  Processing time: {elapsed_time:.1f}s")
+    print(f"  Average FPS: {frame_idx / elapsed_time:.1f}")
+
+    return {
+        "total_frames": frame_idx,
+        "faces_detected": faces_detected,
+        "unique_identities": len(unique_identities),
+        "processing_time": elapsed_time
+    }
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
@@ -413,8 +546,8 @@ Examples:
   # Single image
   python recognize.py --mode image --source photo.jpg --output result.jpg
 
-  # Video file (not yet implemented)
-  python recognize.py --mode video --source meeting.mp4 --output annotated.mp4
+  # Video file
+  python recognize.py --mode video --source meeting.mp4 --output annotated.mp4 --frame-skip 1
         """
     )
 
@@ -442,6 +575,9 @@ Examples:
 
     parser.add_argument("--cascade", default="data/haarcascade_frontalface_default.xml",
                        help="Path to Haar Cascade XML (default: data/haarcascade_frontalface_default.xml)")
+
+    parser.add_argument("--frame-skip", type=int, default=0,
+                       help="Skip frames (0=all, 1=every other, 2=every 3rd, etc.) (default: 0)")
 
     return parser.parse_args()
 
@@ -479,10 +615,20 @@ def main():
             )
 
         elif args.mode == "video":
-            # Video mode (not yet implemented)
-            print("[ERROR] Video mode not yet implemented")
-            print("[INFO] Use webcam mode for now or process video frames manually")
-            sys.exit(1)
+            # Video file mode
+            if not args.source:
+                print("[ERROR] --source required for video mode")
+                sys.exit(1)
+
+            recognize_from_video(
+                video_path=args.source,
+                db_path=args.database,
+                threshold=args.threshold,
+                cascade_path=args.cascade,
+                output_path=args.output,
+                frame_skip=args.frame_skip,
+                resize_width=args.resize_width
+            )
 
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user")
