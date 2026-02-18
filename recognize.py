@@ -406,7 +406,8 @@ def recognize_from_video(video_path: str,
                         cascade_path: str = "data/haarcascade_frontalface_default.xml",
                         output_path: Optional[str] = None,
                         frame_skip: int = 0,
-                        resize_width: int = 640) -> Dict[str, Any]:
+                        resize_width: int = 640,
+                        display: bool = False) -> Dict[str, Any]:
     """
     Face recognition on video file
 
@@ -418,6 +419,7 @@ def recognize_from_video(video_path: str,
         output_path: Optional path to save annotated video
         frame_skip: Skip frames (0=all, 1=every other, 2=every 3rd, etc.)
         resize_width: Resize frame width for performance
+        display: Show frames in real-time window during processing
 
     Returns:
         Dictionary with statistics:
@@ -429,6 +431,13 @@ def recognize_from_video(video_path: str,
     # Load database
     print("[INFO] Loading face database...")
     known_encodings, labels = load_database(db_path)
+
+    # Warn if no output and no display
+    if not output_path and not display:
+        print("[WARN] No output file specified and display disabled")
+        print("[WARN] Video will be processed but no results will be visible")
+        print("[WARN] To save output: use --output flag")
+        print("[WARN] To view in real-time: use --display flag")
 
     # Open video
     print(f"[INFO] Attempting to open video: {video_path}")
@@ -502,6 +511,13 @@ def recognize_from_video(video_path: str,
             if writer and annotated.shape[1] == width and annotated.shape[0] == height:
                 writer.write(annotated)
 
+            # Display in real-time window if requested
+            if display:
+                cv2.imshow("Video Processing (Press 'q' to quit)", annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("[INFO] Quit signal received")
+                    break
+
             # Progress reporting every 30 frames
             if (frame_idx + 1) % 30 == 0:
                 progress = (frame_idx + 1) / max(total_frames, 1) * 100
@@ -513,6 +529,8 @@ def recognize_from_video(video_path: str,
         cap.release()
         if writer:
             writer.release()
+        if display:
+            cv2.destroyAllWindows()
 
     # Calculate elapsed time
     elapsed_time = time.time() - start_time
@@ -546,8 +564,14 @@ Examples:
   # Single image
   python recognize.py --mode image --source photo.jpg --output result.jpg
 
-  # Video file
-  python recognize.py --mode video --source meeting.mp4 --output annotated.mp4 --frame-skip 1
+  # Video file - save output
+  python recognize.py --mode video --source meeting.mp4 --output annotated.mp4
+
+  # Video file - watch in real-time
+  python recognize.py --mode video --source meeting.mp4 --display
+
+  # Video file - save and watch in real-time
+  python recognize.py --mode video --source meeting.mp4 --output annotated.mp4 --display --frame-skip 1
         """
     )
 
@@ -578,6 +602,9 @@ Examples:
 
     parser.add_argument("--frame-skip", type=int, default=0,
                        help="Skip frames (0=all, 1=every other, 2=every 3rd, etc.) (default: 0)")
+
+    parser.add_argument("--display", action="store_true",
+                       help="Display video frames in real-time window during processing (video mode)")
 
     return parser.parse_args()
 
@@ -627,7 +654,8 @@ def main():
                 cascade_path=args.cascade,
                 output_path=args.output,
                 frame_skip=args.frame_skip,
-                resize_width=args.resize_width
+                resize_width=args.resize_width,
+                display=args.display
             )
 
     except KeyboardInterrupt:
