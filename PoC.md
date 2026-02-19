@@ -810,6 +810,31 @@ faiss-gpu>=1.7.0  # Optional
 
 ---
 
-**Last Updated**: 2026-02-05
-**Status**: Phase 1 Ready to Start
-**Next Action**: Begin Phase 1.1 - Video File Support
+## 🔄 Implementation Progress - Option 2 (SimpleTracker + RTSP Combined)
+
+### Completed (Commit 1 - 2026-02-19):
+- ✅ **SimpleTracker class** (~170 lines)
+  - Intelligent IoU-based face tracking
+  - Re-identification triggers: interval (30 frames), movement (IoU < 0.5), face count change
+  - Reduces encoding overhead 3-5x (5 FPS → 15-25 FPS expected)
+- ✅ **detect_faces_only() helper** (~35 lines)
+  - Fast face detection without encoding
+  - Used by SimpleTracker every frame
+  - Encoding only on re-identification
+
+### Upcoming (Commit 2):
+- [ ] Integrate SimpleTracker into recognize_from_webcam()
+- [ ] Add --tracker-interval CLI argument
+
+### Upcoming (Commit 3):
+- [ ] Add recognize_from_rtsp() function with SimpleTracker
+- [ ] Implement RTSP reconnection logic
+
+### Upcoming (Commit 4):
+- [ ] Auto-detect RTSP URLs in main()
+
+---
+
+**Last Updated**: 2026-02-19
+**Status**: Phase 1 - Commit 1 Complete (SimpleTracker Foundation)
+**Next Action**: Commit 2 - Integrate tracker into webcam mode
