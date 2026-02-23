@@ -56,6 +56,20 @@ class SimpleTracker:
         self.last_confidences: List[float] = []
         self.last_distances: List[float] = []
         self.frames_since_identify = 0
+        # Cascade caching to avoid reloading every frame
+        self._classifier: Optional[cv2.CascadeClassifier] = None
+        self._cascade_path: Optional[str] = None
+
+    def _get_classifier(self, cascade_path: str) -> cv2.CascadeClassifier:
+        """Load cascade once, reuse on subsequent calls."""
+        if self._classifier is None or self._cascade_path != cascade_path:
+            if not os.path.isfile(cascade_path):
+                raise FileNotFoundError(f"Cascade file not found: {cascade_path}")
+            self._classifier = cv2.CascadeClassifier(cascade_path)
+            if self._classifier.empty():
+                raise RuntimeError(f"Failed to load cascade: {cascade_path}")
+            self._cascade_path = cascade_path
+        return self._classifier
 
     def compute_iou(self, box1: Tuple[int, int, int, int],
                     box2: Tuple[int, int, int, int]) -> float:
@@ -95,15 +109,13 @@ class SimpleTracker:
 
     def should_reidentify(self, current_boxes: List[Tuple[int, int, int, int]]) -> bool:
         """
-        Determine if we need to run expensive encoding.
+        Determine if we need to run expensive encoding in the current frame.
 
         Returns True if:
         - Interval reached (e.g., 30 frames)
         - Different number of faces
         - Faces moved significantly (IoU < 0.5)
         """
-        self.frames_since_identify += 1
-
         # Force re-identify every N frames
         if self.frames_since_identify >= self.reidentify_interval:
             return True
@@ -127,7 +139,9 @@ class SimpleTracker:
             if max_iou < 0.5:
                 return True
 
-        return False  # All faces stable, reuse cache
+        # All faces stable - increment counter and reuse cache
+        self.frames_since_identify += 1
+        return False
 
     def update(self, boxes: List[Tuple[int, int, int, int]],
                labels: List[str],
@@ -144,24 +158,27 @@ class SimpleTracker:
         """
         Map cached identities to current bounding boxes.
 
-        Strategy: Match current boxes to previous boxes by IoU,
-        reuse the label from the best matching previous detection.
+        Uses greedy assignment to prevent duplicate identity matches.
         """
         detections = []
+        used_indices: set = set()  # Track which previous boxes have been assigned
 
         for curr_box in current_boxes:
-            # Find best matching previous box
+            # Find best matching previous box (that hasn't been used)
             best_iou = 0.0
-            best_idx = 0
+            best_idx = -1
 
             for i, prev_box in enumerate(self.last_boxes):
+                if i in used_indices:  # Skip already-assigned boxes
+                    continue
                 iou = self.compute_iou(curr_box, prev_box)
                 if iou > best_iou:
                     best_iou = iou
                     best_idx = i
 
             # Use cached identity from best match
-            if best_iou > 0.3:  # Reasonable overlap
+            if best_idx >= 0 and best_iou > 0.3:  # Reasonable overlap
+                used_indices.add(best_idx)  # Mark as used
                 detection = Detection(
                     bbox=curr_box,
                     label=self.last_labels[best_idx],
@@ -180,6 +197,31 @@ class SimpleTracker:
             detections.append(detection)
 
         return detections
+
+    def detect_faces(self, frame: np.ndarray, cascade_path: str,
+                     detector_params: Dict[str, Any]) -> List[Tuple[int, int, int, int]]:
+        """
+        Detect faces using cached classifier (fast, no encoding).
+
+        Args:
+            frame: RGB image (numpy array)
+            cascade_path: Path to haarcascade XML
+            detector_params: Detection parameters (scale_factor, min_neighbors, min_size)
+
+        Returns:
+            List of bounding boxes in (x, y, w, h) format
+        """
+        classifier = self._get_classifier(cascade_path)
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+        boxes = classifier.detectMultiScale(
+            gray,
+            scaleFactor=detector_params.get("scale_factor", 1.1),
+            minNeighbors=detector_params.get("min_neighbors", 5),
+            minSize=detector_params.get("min_size", (60, 60)),
+            flags=cv2.CASCADE_SCALE_IMAGE
+        )
+        return [tuple(box) for box in boxes]
 
 
 def load_database(db_path: str) -> Tuple[List[List[float]], List[str]]:
@@ -483,6 +525,14 @@ def recognize_from_webcam(db_path: str,
     fps_smooth = 0.0
     prev_time = time.time()
 
+    # Create tracker for optimized recognition
+    tracker = SimpleTracker(reidentify_interval=30)
+    detector_params = {
+        "scale_factor": 1.1,
+        "min_neighbors": 5,
+        "min_size": (60, 60)
+    }
+
     try:
         while True:
             ret, frame = cap.read()
@@ -498,8 +548,22 @@ def recognize_from_webcam(db_path: str,
             # Convert BGR to RGB for face_recognition
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Process frame
-            detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+            # Fast detection every frame (uses cached classifier)
+            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, detector_params)
+
+            if tracker.should_reidentify(current_boxes):
+                # Full recognition (expensive) - only when needed
+                detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+                # Update tracker cache
+                tracker.update(
+                    boxes=[d.bbox for d in detections],
+                    labels=[d.label for d in detections],
+                    confidences=[d.confidence for d in detections],
+                    distances=[d.distance for d in detections]
+                )
+            else:
+                # Reuse cached identities (fast)
+                detections = tracker.get_cached_detections(current_boxes)
 
             # Calculate FPS
             curr_time = time.time()
@@ -662,7 +726,15 @@ def recognize_from_video(video_path: str,
     faces_detected = 0
     unique_identities = set()
 
-    print("[INFO] Processing video...")
+    # Create tracker for optimized recognition
+    tracker = SimpleTracker(reidentify_interval=30)
+    detector_params = {
+        "scale_factor": 1.1,
+        "min_neighbors": 5,
+        "min_size": (60, 60)
+    }
+
+    print("[INFO] Processing video with SimpleTracker optimization...")
 
     try:
         while True:
@@ -683,8 +755,22 @@ def recognize_from_video(video_path: str,
             # Convert BGR to RGB for face_recognition
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Process frame
-            detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+            # Fast detection every frame (uses cached classifier)
+            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, detector_params)
+
+            if tracker.should_reidentify(current_boxes):
+                # Full recognition (expensive) - only when needed
+                detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+                # Update tracker cache
+                tracker.update(
+                    boxes=[d.bbox for d in detections],
+                    labels=[d.label for d in detections],
+                    confidences=[d.confidence for d in detections],
+                    distances=[d.distance for d in detections]
+                )
+            else:
+                # Reuse cached identities (fast)
+                detections = tracker.get_cached_detections(current_boxes)
 
             # Update statistics
             faces_detected += len(detections)
