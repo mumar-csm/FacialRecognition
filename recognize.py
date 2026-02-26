@@ -24,6 +24,13 @@ from euclideanDist import euclidean_distance, l2_normalize
 from build_encodings import EncodingsDB
 
 
+DEFAULT_DETECTOR_PARAMS = {
+    "scale_factor": 1.1,
+    "min_neighbors": 5,
+    "min_size": (60, 60),
+}
+
+
 # Detection result dataclass
 @dataclass
 class Detection:
@@ -368,45 +375,6 @@ def detect_and_encode_faces(frame: np.ndarray,
     return results
 
 
-def detect_faces_only(frame: np.ndarray,
-                      cascade_path: str,
-                      detector_params: Dict[str, Any]) -> List[Tuple[int, int, int, int]]:
-    """
-    Detect faces in frame WITHOUT encoding (fast).
-
-    Used by SimpleTracker to quickly detect faces every frame,
-    then only encode when needed (every N frames or on movement).
-
-    Args:
-        frame: RGB image (numpy array)
-        cascade_path: Path to haarcascade XML
-        detector_params: Detection parameters (scale_factor, min_neighbors, min_size)
-
-    Returns:
-        List of bounding boxes in (x, y, w, h) format
-    """
-    # Load Haar Cascade
-    if not os.path.isfile(cascade_path):
-        raise FileNotFoundError(f"Cascade file not found: {cascade_path}")
-
-    classifier = cv2.CascadeClassifier(cascade_path)
-    if classifier.empty():
-        raise RuntimeError(f"Failed to load cascade: {cascade_path}")
-
-    # Convert to grayscale for detection
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-
-    # Detect faces
-    boxes = classifier.detectMultiScale(
-        gray,
-        scaleFactor=detector_params.get("scale_factor", 1.1),
-        minNeighbors=detector_params.get("min_neighbors", 5),
-        minSize=detector_params.get("min_size", (60, 60)),
-        flags=cv2.CASCADE_SCALE_IMAGE
-    )
-
-    return [tuple(box) for box in boxes]
-
 
 def process_frame(frame: np.ndarray,
                  known_encodings: List[List[float]],
@@ -429,11 +397,7 @@ def process_frame(frame: np.ndarray,
         List of Detection objects
     """
     if detector_params is None:
-        detector_params = {
-            "scale_factor": 1.1,
-            "min_neighbors": 5,
-            "min_size": (60, 60)
-        }
+        detector_params = DEFAULT_DETECTOR_PARAMS
 
     # Detect and encode faces
     face_data = detect_and_encode_faces(frame, cascade_path, detector_params)
@@ -513,7 +477,7 @@ def recognize_from_webcam(db_path: str,
 
     # Open webcam
     print(f"[INFO] Opening camera {camera_index}...")
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(camera_index) # use cv2.CAP_DSHOW on Windows to reduce latency: cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
 
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open camera {camera_index}")
@@ -527,11 +491,6 @@ def recognize_from_webcam(db_path: str,
 
     # Create tracker for optimized recognition
     tracker = SimpleTracker(reidentify_interval=30)
-    detector_params = {
-        "scale_factor": 1.1,
-        "min_neighbors": 5,
-        "min_size": (60, 60)
-    }
 
     try:
         while True:
@@ -549,7 +508,7 @@ def recognize_from_webcam(db_path: str,
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Fast detection every frame (uses cached classifier)
-            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, detector_params)
+            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, DEFAULT_DETECTOR_PARAMS)
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
@@ -706,14 +665,24 @@ def recognize_from_video(video_path: str,
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    # Compute output dimensions (matches resize logic in processing loop)
+    if resize_width and width > resize_width:
+        scale = resize_width / width
+        out_w = resize_width
+        out_h = int(height * scale)
+    else:
+        out_w = width
+        out_h = height
+
     print(f"[INFO] Video properties: {width}x{height} @ {fps:.1f} FPS, {total_frames} frames total")
+    print(f"[INFO] Output dimensions: {out_w}x{out_h}")
     print(f"[INFO] Frame skip: {frame_skip} (processing every {frame_skip + 1}th frame)")
 
     # Create video writer if output requested
     writer = None
     if output_path:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use mp4v codec
-        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
         if not writer.isOpened():
             print(f"[WARN] Failed to create video writer for {output_path}")
             writer = None
@@ -728,11 +697,6 @@ def recognize_from_video(video_path: str,
 
     # Create tracker for optimized recognition
     tracker = SimpleTracker(reidentify_interval=30)
-    detector_params = {
-        "scale_factor": 1.1,
-        "min_neighbors": 5,
-        "min_size": (60, 60)
-    }
 
     print("[INFO] Processing video with SimpleTracker optimization...")
 
@@ -756,7 +720,7 @@ def recognize_from_video(video_path: str,
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Fast detection every frame (uses cached classifier)
-            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, detector_params)
+            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, DEFAULT_DETECTOR_PARAMS)
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
@@ -782,7 +746,7 @@ def recognize_from_video(video_path: str,
             annotated = draw_annotations(frame, detections)
 
             # Write to output video if requested
-            if writer and annotated.shape[1] == width and annotated.shape[0] == height:
+            if writer:
                 writer.write(annotated)
 
             # Display in real-time window if requested
@@ -815,7 +779,7 @@ def recognize_from_video(video_path: str,
     print(f"  Faces detected: {faces_detected}")
     print(f"  Unique identities: {len(unique_identities)}")
     print(f"  Processing time: {elapsed_time:.1f}s")
-    print(f"  Average FPS: {frame_idx / elapsed_time:.1f}")
+    print(f"  Average FPS: {frame_idx / elapsed_time:.1f}" if elapsed_time > 0 else "  Average FPS: N/A")
 
     return {
         "total_frames": frame_idx,

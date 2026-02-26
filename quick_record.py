@@ -2,7 +2,7 @@ import cv2
 import time
 
 print("Recording 10-second test video...")
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Use DirectShow backend for better performance on Windows
+cap = cv2.VideoCapture(0)
 
 # get camera properties
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
