@@ -91,7 +91,12 @@
   - [ ] Reset attempt counter on successful reconnection
   - [ ] Exit after max attempts reached
 
-- [ ] **Extend webcam mode to auto-detect RTSP** in [recognize.py](recognize.py) (lines 263-340)
+- [ ] **Add `--tracker-interval` CLI argument** in [recognize.py](recognize.py) parse_args()
+  - [ ] Add argument: `--tracker-interval` type=int, default=30
+  - [ ] Document: "Frames between re-identification (default: 30, ~1 second at 30 FPS)"
+  - [ ] Pass to SimpleTracker(reidentify_interval=args.tracker_interval) in all modes
+
+- [ ] **Extend webcam mode to auto-detect RTSP** in [recognize.py](recognize.py) main() (lines 850-904)
   - [ ] Check if source starts with "rtsp://"
   - [ ] If RTSP URL detected, call `recognize_from_rtsp()` instead of webcam function
   - [ ] Otherwise, parse as integer camera index and proceed normally
@@ -187,7 +192,7 @@ Examples:
 - [ ] **Create worker function** in [build_encodings.py](build_encodings.py) (before cli_main)
   - [ ] Define `encode_single_image(args)` function
   - [ ] Unpack args: (image_record, config_dict)
-  - [ ] Move existing encoding logic from lines 428-538 into this function
+  - [ ] Move existing encoding logic from cli_main() (lines ~427-527 in build_encodings.py) into this function
   - [ ] Load and validate image
   - [ ] Preprocess image
   - [ ] Detect faces
@@ -196,7 +201,7 @@ Examples:
   - [ ] Return FaceRecord or None on error
   - [ ] Ensure all errors are caught and logged
 
-- [ ] **Modify cli_main()** in [build_encodings.py](build_encodings.py) (lines 427-538)
+- [ ] **Modify cli_main()** in [build_encodings.py](build_encodings.py) (lines 366-563)
   - [ ] Import: `from multiprocessing import Pool, cpu_count`
   - [ ] Prepare work items: list of (image_record, config_dict) tuples
   - [ ] Calculate num_workers: `max(1, cpu_count() - 1)` (leave one core free)
@@ -233,8 +238,10 @@ Examples:
 
 ### 2.3 Threshold Tuning Tool (2 days)
 
+> **Scope note**: This is a one-time analysis tool, not a runtime dependency. Consider implementing as a Jupyter notebook instead of a CLI script to avoid adding matplotlib/scikit-learn as permanent project dependencies. The output (recommended threshold value) is what matters — the tool itself only needs to run once per database rebuild.
+
 #### Tasks:
-- [ ] **Create tune_threshold.py script** (new file)
+- [ ] **Create tune_threshold.py script** (new file, or Jupyter notebook)
   - [ ] Add shebang and docstring
   - [ ] Import: pickle, numpy, matplotlib, sklearn
   - [ ] Add `compute_distances(encodings, labels)` function
@@ -337,17 +344,17 @@ Examples:
     - [ ] choices=["haar", "retinaface"], default="haar"
   - [ ] Add `--align` flag in parse_args()
     - [ ] action="store_true", help="Enable face alignment"
-  - [ ] Modify `detect_and_encode_faces()` function (lines 132-150)
+  - [ ] Modify `detect_and_encode_faces()` function (lines 313-375)
     - [ ] Accept detector object instead of cascade_path
     - [ ] Call detector.detect(frame) instead of Haar cascade
     - [ ] Iterate through detections (bbox, landmarks)
     - [ ] If align flag and landmarks available: align face
     - [ ] Otherwise: extract ROI as before
     - [ ] Encode face and collect results
-  - [ ] Update `recognize_from_webcam()` (line ~283)
+  - [ ] Update `recognize_from_webcam()` (lines 457-550)
     - [ ] Create detector: `detector = create_detector(args.detector, ...)`
     - [ ] Pass detector to detect_and_encode_faces()
-  - [ ] Update `recognize_from_image()` (line ~362)
+  - [ ] Update `recognize_from_image()` (lines 553-611)
     - [ ] Create detector
     - [ ] Pass detector to detect_and_encode_faces()
   - [ ] Update `recognize_from_video()` (new function)
@@ -361,7 +368,7 @@ Examples:
   - [ ] Import: `from detector_factory import create_detector, align_face`
   - [ ] Add `--detector` argument in parse_args()
   - [ ] Add `--align` flag in parse_args()
-  - [ ] Modify detect_faces() call (line ~200-223)
+  - [ ] Modify detect_faces() call in cli_main() (line ~437 in build_encodings.py)
     - [ ] Create detector instance
     - [ ] Call detector.detect() instead of cv2 cascade
   - [ ] Update encoding logic to use alignment if enabled
@@ -420,13 +427,13 @@ Examples:
     - [ ] Support: "dlib", "arcface"
     - [ ] Return appropriate embedder instance
 
-- [ ] **Update EncodingsDB schema** in [build_encodings.py](build_encodings.py) (lines 548-582)
+- [ ] **Update EncodingsDB schema** in [build_encodings.py](build_encodings.py) (lines 39-48)
   - [ ] Add field: `version: str = "schema_v2"`
   - [ ] Add field: `embedding_dim: int = 128`
   - [ ] Add field: `embedder_type: str = "dlib"`
   - [ ] Keep backward compatibility with v1 databases
 
-- [ ] **Update database loader** in [recognize.py](recognize.py) (lines 37-70)
+- [ ] **Update database loader** in [recognize.py](recognize.py) (lines 234-267)
   - [ ] Modify `load_database()` function
   - [ ] Check for embedder_type field (use getattr with default)
   - [ ] Check for embedding_dim field (use getattr with default)
@@ -538,6 +545,7 @@ Examples:
   - [ ] Columns: id (PRIMARY KEY), timestamp (TEXT), camera_name (TEXT), location (TEXT), identity (TEXT), confidence (REAL), distance (REAL), bbox_x (INT), bbox_y (INT), bbox_w (INT), bbox_h (INT)
   - [ ] Add index on timestamp for faster queries
   - [ ] Add index on identity for faster lookups
+  - [ ] **Enable WAL mode**: `PRAGMA journal_mode=WAL` — required for safe concurrent writes from multiple processes. Without WAL, simultaneous inserts from different camera workers will cause "database is locked" errors
 
 - [ ] **Create query examples documentation**
   - [ ] Document in README or separate QUERIES.md
@@ -665,29 +673,34 @@ Examples:
 
 ## 🎯 Performance Targets Summary
 
-### Current Baseline (Before Optimizations):
-- ⏱️ Face encoding: 100-200ms per face
-- 📹 Real-time FPS: ~5 FPS (single camera)
+### Original Baseline (Before Any Optimizations):
+- ⏱️ Face encoding: 100-200ms per face (dlib)
+- 📹 Real-time FPS: ~5 FPS (single camera, no tracker)
 - 📊 Enrollment: ~5 minutes for 100 images
 - 🔍 Detection: Haar Cascade (medium accuracy)
 
-### After Phase 1 (Video/RTSP):
-- ✅ Video processing: Working
+### After Phase 1.1 + 2.1 (Video + SimpleTracker) — ACTUAL:
+- ✅ Video processing: Working with SimpleTracker optimization
+- ⚡ Real-time FPS: **~88-89 FPS on M4 Mac** (1920x1080→640x360, threshold 0.6-0.7)
+- ⚡ Real-time FPS: **~19 FPS baseline on Windows laptop** (before SimpleTracker)
+- ⚡ SimpleTracker reduces encoding calls ~30x (only re-identifies every 30 frames)
+
+### After Phase 1.2 (RTSP) — Target:
 - ✅ RTSP streams: Working with reconnection
+- ✅ SimpleTracker integrated in RTSP mode
 
-### After Phase 2 (CPU Optimizations):
-- ⚡ Real-time FPS: ~15-25 FPS (3-5x improvement)
-- ⚡ Enrollment: ~30-60 seconds for 100 images (4-8x improvement)
+### After Phase 2.2-2.3 (Multiprocessing + Threshold Tuning) — Target:
+- ⚡ Enrollment: ~30-60 seconds for 100 images (4-8x improvement via multiprocessing)
+- 🎯 Data-driven threshold recommendation
 
-### After Phase 3 (Library Modernization):
-- 🚀 Face encoding: 10-20ms per face (5-10x improvement)
-- 🚀 Real-time FPS: ~30-50 FPS single camera
-- 🚀 Enrollment: ~15-30 seconds for 100 images
-- 🎯 Detection: RetinaFace (high accuracy + landmarks)
+### After Phase 3 (Library Modernization) — Target:
+- 🚀 Face encoding: 10-20ms per face (ArcFace vs 100-200ms dlib)
+- 🚀 Encoding speedup compounds with SimpleTracker (faster re-identify frames)
+- 🎯 Detection: RetinaFace (high accuracy + landmarks for alignment)
 - 📈 Matching accuracy: 99.80% vs 99.38%
 
-### After Phase 6 (GPU Acceleration):
-- 🔥 Face encoding: 1-2ms per face (50-100x vs original)
+### After Phase 6 (GPU Acceleration) — Target:
+- 🔥 Face encoding: 1-2ms per face (50-100x vs original dlib)
 - 🔥 Real-time FPS: 60+ FPS per camera
 - 🔥 Enrollment: ~10-20 seconds for 100 images
 
