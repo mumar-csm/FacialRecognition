@@ -26,44 +26,44 @@
 ### 1.1 Video File Support (2 days)
 
 #### Tasks:
-- [ ] **Add `recognize_from_video()` function** in [recognize.py](recognize.py) (after line 400)
-  - [ ] Load face database using `load_database()`
-  - [ ] Open video file with `cv2.VideoCapture(video_path)`
-  - [ ] Get video properties (FPS, total frames, resolution)
-  - [ ] Implement frame reading loop with frame skip logic
-  - [ ] Add progress reporting: "Processing frame X/Y (Z%)"
-  - [ ] Process each frame using existing `process_frame()` function
-  - [ ] Create video writer for annotated output using `cv2.VideoWriter()`
-  - [ ] Write fourcc codec matching input video
-  - [ ] Collect statistics: total frames, faces detected, unique identities
-  - [ ] Return statistics dictionary
+- [x] **Add `recognize_from_video()` function** in [recognize.py](recognize.py)
+  - [x] Load face database using `load_database()`
+  - [x] Open video file with `cv2.VideoCapture(video_path)`
+  - [x] Get video properties (FPS, total frames, resolution)
+  - [x] Implement frame reading loop with frame skip logic
+  - [x] Add progress reporting: "Processing frame X/Y (Z%)"
+  - [x] Process each frame using existing `process_frame()` function
+  - [x] Create video writer for annotated output using `cv2.VideoWriter()`
+  - [x] Write fourcc codec matching input video
+  - [x] Collect statistics: total frames, faces detected, unique identities
+  - [x] Return statistics dictionary
 
-- [ ] **Add `--frame-skip` CLI argument** in [recognize.py](recognize.py) parse_args()
-  - [ ] Add argument: `--frame-skip` type=int, default=0
-  - [ ] Document: "Process every Nth frame (0=all, 1=every other, 2=every 3rd)"
+- [x] **Add `--frame-skip` CLI argument** in [recognize.py](recognize.py) parse_args()
+  - [x] Add argument: `--frame-skip` type=int, default=0
+  - [x] Document: "Process every Nth frame (0=all, 1=every other, 2=every 3rd)"
 
-- [ ] **Update video mode handler** in [recognize.py](recognize.py) main() (lines 481-485)
-  - [ ] Replace error message with call to `recognize_from_video()`
-  - [ ] Pass all required arguments: source, database, threshold, cascade, output, frame_skip, resize_width
-  - [ ] Print summary statistics after processing
-  - [ ] Format: total frames, faces detected, unique identities, processing time
+- [x] **Update video mode handler** in [recognize.py](recognize.py) main()
+  - [x] Replace error message with call to `recognize_from_video()`
+  - [x] Pass all required arguments: source, database, threshold, cascade, output, frame_skip, resize_width
+  - [x] Print summary statistics after processing
+  - [x] Format: total frames, faces detected, unique identities, processing time
 
 #### Testing Checklist:
-- [ ] Test with short video (5-10 seconds)
-- [ ] Test with .mp4 file (H.264 codec)
+- [x] Test with short video (5-10 seconds)
+- [x] Test with .mp4 file (H.264 codec)
 - [ ] Test with .avi file (MJPEG codec)
-- [ ] Test frame skip: `--frame-skip 0` (all frames)
-- [ ] Test frame skip: `--frame-skip 1` (every other frame)
-- [ ] Test frame skip: `--frame-skip 2` (every 3rd frame)
+- [x] Test frame skip: `--frame-skip 0` (all frames)
+- [x] Test frame skip: `--frame-skip 1` (every other frame)
+- [x] Test frame skip: `--frame-skip 2` (every 3rd frame)
 - [ ] Verify output video is playable in VLC
-- [ ] Verify annotations are correct (bounding boxes, labels)
-- [ ] Measure FPS difference with different skip values
+- [x] Verify annotations are correct (bounding boxes, labels)
+- [x] Measure FPS difference with different skip values
 
 #### Success Criteria:
-- [ ] Video mode works without errors
-- [ ] Output video has correct annotations
-- [ ] Frame skipping reduces processing time proportionally
-- [ ] Statistics are accurate and informative
+- [x] Video mode works without errors
+- [x] Output video has correct annotations
+- [x] Frame skipping reduces processing time proportionally
+- [x] Statistics are accurate and informative
 
 ---
 
@@ -91,7 +91,12 @@
   - [ ] Reset attempt counter on successful reconnection
   - [ ] Exit after max attempts reached
 
-- [ ] **Extend webcam mode to auto-detect RTSP** in [recognize.py](recognize.py) (lines 263-340)
+- [ ] **Add `--tracker-interval` CLI argument** in [recognize.py](recognize.py) parse_args()
+  - [ ] Add argument: `--tracker-interval` type=int, default=30
+  - [ ] Document: "Frames between re-identification (default: 30, ~1 second at 30 FPS)"
+  - [ ] Pass to SimpleTracker(reidentify_interval=args.tracker_interval) in all modes
+
+- [ ] **Extend webcam mode to auto-detect RTSP** in [recognize.py](recognize.py) main() (lines 850-904)
   - [ ] Check if source starts with "rtsp://"
   - [ ] If RTSP URL detected, call `recognize_from_rtsp()` instead of webcam function
   - [ ] Otherwise, parse as integer camera index and proceed normally
@@ -132,46 +137,46 @@ Examples:
 ### 2.1 Frame Skipping & Smart Processing (2 days)
 
 #### Tasks:
-- [ ] **Create `SimpleTracker` class** in [recognize.py](recognize.py) (after Detection class, ~line 35)
-  - [ ] Add `__init__` with reidentify_interval parameter (default: 30 frames)
-  - [ ] Add `last_boxes` list to store previous frame bounding boxes
-  - [ ] Add `last_labels` list to store previous frame identities
-  - [ ] Add `last_confidences` list to store previous confidences
-  - [ ] Add `frames_since_identify` counter
-  - [ ] Implement `compute_iou(box1, box2)` method
-    - [ ] Calculate intersection area
-    - [ ] Calculate union area
-    - [ ] Return IoU ratio
-  - [ ] Implement `should_reidentify(current_boxes)` method
-    - [ ] Increment frames_since_identify counter
-    - [ ] Return True if counter >= reidentify_interval
-    - [ ] Check IoU between current and previous boxes
-    - [ ] Return True if boxes moved significantly (IoU < 0.5)
-    - [ ] Otherwise return False
-  - [ ] Implement `update(boxes, labels, confidences)` method
-    - [ ] Store current frame data as "last" data
-    - [ ] Reset counter if re-identification occurred
+- [x] **Create `SimpleTracker` class** in [recognize.py](recognize.py) (after Detection class)
+  - [x] Add `__init__` with reidentify_interval parameter (default: 30 frames)
+  - [x] Add `last_boxes` list to store previous frame bounding boxes
+  - [x] Add `last_labels` list to store previous frame identities
+  - [x] Add `last_confidences` list to store previous confidences
+  - [x] Add `frames_since_identify` counter
+  - [x] Implement `compute_iou(box1, box2)` method
+    - [x] Calculate intersection area
+    - [x] Calculate union area
+    - [x] Return IoU ratio
+  - [x] Implement `should_reidentify(current_boxes)` method
+    - [x] Increment frames_since_identify counter
+    - [x] Return True if counter >= reidentify_interval
+    - [x] Check IoU between current and previous boxes
+    - [x] Return True if boxes moved significantly (IoU < 0.5)
+    - [x] Otherwise return False
+  - [x] Implement `update(boxes, labels, confidences)` method
+    - [x] Store current frame data as "last" data
+    - [x] Reset counter if re-identification occurred
 
-- [ ] **Integrate tracker in webcam mode** [recognize.py](recognize.py) (lines 299-334)
-  - [ ] Create SimpleTracker instance before loop
-  - [ ] In loop: detect faces every frame (Haar is fast)
-  - [ ] Check if re-identification needed via `tracker.should_reidentify()`
-  - [ ] If True: encode and match faces as normal
-  - [ ] If False: reuse cached labels and confidences
-  - [ ] Update tracker with current frame data
+- [x] **Integrate tracker in webcam mode** [recognize.py](recognize.py)
+  - [x] Create SimpleTracker instance before loop
+  - [x] In loop: detect faces every frame (Haar is fast)
+  - [x] Check if re-identification needed via `tracker.should_reidentify()`
+  - [x] If True: encode and match faces as normal
+  - [x] If False: reuse cached labels and confidences
+  - [x] Update tracker with current frame data
 
 - [ ] **Add tracker to RTSP mode**
   - [ ] Duplicate tracker integration in RTSP function
 
 #### Testing Checklist:
-- [ ] Test webcam with tracker enabled
-- [ ] Verify identities remain stable when person is stationary
-- [ ] Verify re-identification occurs when person moves
-- [ ] Verify re-identification occurs every 30 frames (1 second at 30 FPS)
-- [ ] Measure FPS before tracker: baseline
-- [ ] Measure FPS after tracker: should be 3-5x higher
+- [x] Test webcam with tracker enabled
+- [x] Verify identities remain stable when person is stationary
+- [x] Verify re-identification occurs when person moves
+- [x] Verify re-identification occurs every 30 frames (1 second at 30 FPS)
+- [x] Measure FPS before tracker: baseline
+- [x] Measure FPS after tracker: should be 3-5x higher
 - [ ] Test with multiple faces in frame
-- [ ] Verify no crashes or memory leaks during long runs
+- [x] Verify no crashes or memory leaks during long runs
 
 #### Success Criteria:
 - [ ] Real-time FPS improves by 3-5x
@@ -187,7 +192,7 @@ Examples:
 - [ ] **Create worker function** in [build_encodings.py](build_encodings.py) (before cli_main)
   - [ ] Define `encode_single_image(args)` function
   - [ ] Unpack args: (image_record, config_dict)
-  - [ ] Move existing encoding logic from lines 428-538 into this function
+  - [ ] Move existing encoding logic from cli_main() (lines ~427-527 in build_encodings.py) into this function
   - [ ] Load and validate image
   - [ ] Preprocess image
   - [ ] Detect faces
@@ -196,7 +201,7 @@ Examples:
   - [ ] Return FaceRecord or None on error
   - [ ] Ensure all errors are caught and logged
 
-- [ ] **Modify cli_main()** in [build_encodings.py](build_encodings.py) (lines 427-538)
+- [ ] **Modify cli_main()** in [build_encodings.py](build_encodings.py) (lines 366-563)
   - [ ] Import: `from multiprocessing import Pool, cpu_count`
   - [ ] Prepare work items: list of (image_record, config_dict) tuples
   - [ ] Calculate num_workers: `max(1, cpu_count() - 1)` (leave one core free)
@@ -233,8 +238,10 @@ Examples:
 
 ### 2.3 Threshold Tuning Tool (2 days)
 
+> **Scope note**: This is a one-time analysis tool, not a runtime dependency. Consider implementing as a Jupyter notebook instead of a CLI script to avoid adding matplotlib/scikit-learn as permanent project dependencies. The output (recommended threshold value) is what matters — the tool itself only needs to run once per database rebuild.
+
 #### Tasks:
-- [ ] **Create tune_threshold.py script** (new file)
+- [ ] **Create tune_threshold.py script** (new file, or Jupyter notebook)
   - [ ] Add shebang and docstring
   - [ ] Import: pickle, numpy, matplotlib, sklearn
   - [ ] Add `compute_distances(encodings, labels)` function
@@ -337,17 +344,17 @@ Examples:
     - [ ] choices=["haar", "retinaface"], default="haar"
   - [ ] Add `--align` flag in parse_args()
     - [ ] action="store_true", help="Enable face alignment"
-  - [ ] Modify `detect_and_encode_faces()` function (lines 132-150)
+  - [ ] Modify `detect_and_encode_faces()` function (lines 313-375)
     - [ ] Accept detector object instead of cascade_path
     - [ ] Call detector.detect(frame) instead of Haar cascade
     - [ ] Iterate through detections (bbox, landmarks)
     - [ ] If align flag and landmarks available: align face
     - [ ] Otherwise: extract ROI as before
     - [ ] Encode face and collect results
-  - [ ] Update `recognize_from_webcam()` (line ~283)
+  - [ ] Update `recognize_from_webcam()` (lines 457-550)
     - [ ] Create detector: `detector = create_detector(args.detector, ...)`
     - [ ] Pass detector to detect_and_encode_faces()
-  - [ ] Update `recognize_from_image()` (line ~362)
+  - [ ] Update `recognize_from_image()` (lines 553-611)
     - [ ] Create detector
     - [ ] Pass detector to detect_and_encode_faces()
   - [ ] Update `recognize_from_video()` (new function)
@@ -361,7 +368,7 @@ Examples:
   - [ ] Import: `from detector_factory import create_detector, align_face`
   - [ ] Add `--detector` argument in parse_args()
   - [ ] Add `--align` flag in parse_args()
-  - [ ] Modify detect_faces() call (line ~200-223)
+  - [ ] Modify detect_faces() call in cli_main() (line ~437 in build_encodings.py)
     - [ ] Create detector instance
     - [ ] Call detector.detect() instead of cv2 cascade
   - [ ] Update encoding logic to use alignment if enabled
@@ -420,13 +427,13 @@ Examples:
     - [ ] Support: "dlib", "arcface"
     - [ ] Return appropriate embedder instance
 
-- [ ] **Update EncodingsDB schema** in [build_encodings.py](build_encodings.py) (lines 548-582)
+- [ ] **Update EncodingsDB schema** in [build_encodings.py](build_encodings.py) (lines 39-48)
   - [ ] Add field: `version: str = "schema_v2"`
   - [ ] Add field: `embedding_dim: int = 128`
   - [ ] Add field: `embedder_type: str = "dlib"`
   - [ ] Keep backward compatibility with v1 databases
 
-- [ ] **Update database loader** in [recognize.py](recognize.py) (lines 37-70)
+- [ ] **Update database loader** in [recognize.py](recognize.py) (lines 234-267)
   - [ ] Modify `load_database()` function
   - [ ] Check for embedder_type field (use getattr with default)
   - [ ] Check for embedding_dim field (use getattr with default)
@@ -538,6 +545,7 @@ Examples:
   - [ ] Columns: id (PRIMARY KEY), timestamp (TEXT), camera_name (TEXT), location (TEXT), identity (TEXT), confidence (REAL), distance (REAL), bbox_x (INT), bbox_y (INT), bbox_w (INT), bbox_h (INT)
   - [ ] Add index on timestamp for faster queries
   - [ ] Add index on identity for faster lookups
+  - [ ] **Enable WAL mode**: `PRAGMA journal_mode=WAL` — required for safe concurrent writes from multiple processes. Without WAL, simultaneous inserts from different camera workers will cause "database is locked" errors
 
 - [ ] **Create query examples documentation**
   - [ ] Document in README or separate QUERIES.md
@@ -665,29 +673,34 @@ Examples:
 
 ## 🎯 Performance Targets Summary
 
-### Current Baseline (Before Optimizations):
-- ⏱️ Face encoding: 100-200ms per face
-- 📹 Real-time FPS: ~5 FPS (single camera)
+### Original Baseline (Before Any Optimizations):
+- ⏱️ Face encoding: 100-200ms per face (dlib)
+- 📹 Real-time FPS: ~5 FPS (single camera, no tracker)
 - 📊 Enrollment: ~5 minutes for 100 images
 - 🔍 Detection: Haar Cascade (medium accuracy)
 
-### After Phase 1 (Video/RTSP):
-- ✅ Video processing: Working
+### After Phase 1.1 + 2.1 (Video + SimpleTracker) — ACTUAL:
+- ✅ Video processing: Working with SimpleTracker optimization
+- ⚡ Real-time FPS: **~88-89 FPS on M4 Mac** (1920x1080→640x360, threshold 0.6-0.7)
+- ⚡ Real-time FPS: **~19 FPS baseline on Windows laptop** (before SimpleTracker)
+- ⚡ SimpleTracker reduces encoding calls ~30x (only re-identifies every 30 frames)
+
+### After Phase 1.2 (RTSP) — Target:
 - ✅ RTSP streams: Working with reconnection
+- ✅ SimpleTracker integrated in RTSP mode
 
-### After Phase 2 (CPU Optimizations):
-- ⚡ Real-time FPS: ~15-25 FPS (3-5x improvement)
-- ⚡ Enrollment: ~30-60 seconds for 100 images (4-8x improvement)
+### After Phase 2.2-2.3 (Multiprocessing + Threshold Tuning) — Target:
+- ⚡ Enrollment: ~30-60 seconds for 100 images (4-8x improvement via multiprocessing)
+- 🎯 Data-driven threshold recommendation
 
-### After Phase 3 (Library Modernization):
-- 🚀 Face encoding: 10-20ms per face (5-10x improvement)
-- 🚀 Real-time FPS: ~30-50 FPS single camera
-- 🚀 Enrollment: ~15-30 seconds for 100 images
-- 🎯 Detection: RetinaFace (high accuracy + landmarks)
+### After Phase 3 (Library Modernization) — Target:
+- 🚀 Face encoding: 10-20ms per face (ArcFace vs 100-200ms dlib)
+- 🚀 Encoding speedup compounds with SimpleTracker (faster re-identify frames)
+- 🎯 Detection: RetinaFace (high accuracy + landmarks for alignment)
 - 📈 Matching accuracy: 99.80% vs 99.38%
 
-### After Phase 6 (GPU Acceleration):
-- 🔥 Face encoding: 1-2ms per face (50-100x vs original)
+### After Phase 6 (GPU Acceleration) — Target:
+- 🔥 Face encoding: 1-2ms per face (50-100x vs original dlib)
 - 🔥 Real-time FPS: 60+ FPS per camera
 - 🔥 Enrollment: ~10-20 seconds for 100 images
 
@@ -797,8 +810,13 @@ faiss-gpu>=1.7.0  # Optional
 - Note any bugs or issues encountered
 - Track time spent per phase
 
+### Known Issues & Trade-offs:
+
+#### Double face detection on re-identify frames (minor inefficiency)
+When `should_reidentify()` returns True, `tracker.detect_faces()` has already run detection, but then `process_frame()` runs `detect_and_encode_faces()` which detects again from scratch. This means face detection happens twice on re-identify frames. A proper fix would be an encode-only function that accepts pre-detected boxes, skipping the redundant detection — but `process_frame()` is also used by image mode where there's no tracker, so it can't simply lose its detection step. Since re-identification only triggers every ~30 frames (once per second at 30 FPS) and detection is ~5-10ms, this wastes ~5-10ms per second. Not nothing, but not critical either. Worth addressing if we refactor the detection/encoding pipeline in Phase 3.
+
 ### Performance Results:
-- Phase 1: (Fill in after completion)
+- Phase 1 + 2.1 (Video + SimpleTracker): ~88-89 FPS on M4 Mac (test_video.mp4, 1920x1080→640x360, threshold 0.6-0.7). ~19 FPS baseline on Windows laptop before SimpleTracker.
 - Phase 2: (Fill in after completion)
 - Phase 3: (Fill in after completion)
 - Phase 4: (Fill in after completion)
@@ -810,6 +828,33 @@ faiss-gpu>=1.7.0  # Optional
 
 ---
 
-**Last Updated**: 2026-02-05
-**Status**: Phase 1 Ready to Start
-**Next Action**: Begin Phase 1.1 - Video File Support
+## 🔄 Implementation Progress - Option 2 (SimpleTracker + RTSP Combined)
+
+### Completed (Commit 1 - 2026-02-19):
+- ✅ **SimpleTracker class** (~170 lines)
+  - Intelligent IoU-based face tracking
+  - Re-identification triggers: interval (30 frames), movement (IoU < 0.5), face count change
+  - Reduces encoding overhead 3-5x (5 FPS → 15-25 FPS expected)
+
+### Completed (2026-02-26 - Bug fixes & cleanup):
+- ✅ **SimpleTracker integrated into webcam mode** — tracker used in `recognize_from_webcam()`
+- ✅ **`recognize_from_video()` function** — full video processing with SimpleTracker optimization
+- ✅ **`--frame-skip` CLI argument** — configurable frame skipping
+- ✅ **Video mode handler** — wired up in `main()` with all arguments
+- ✅ **Bug fix: division by zero** — guarded `elapsed_time` in video summary
+- ✅ **Bug fix: video writer empty output** — writer now uses computed output dimensions matching resize
+- ✅ **Bug fix: CAP_DSHOW on macOS** — removed Windows-only backend, let OpenCV auto-select
+- ✅ **Removed dead code** — `detect_faces_only()` (superseded by `SimpleTracker.detect_faces()`)
+- ✅ **Extracted `DEFAULT_DETECTOR_PARAMS`** — single module-level constant replacing 3 inline dicts
+
+### Upcoming:
+- [ ] Add recognize_from_rtsp() function with SimpleTracker
+- [ ] Implement RTSP reconnection logic
+- [ ] Auto-detect RTSP URLs in main()
+- [ ] Add --tracker-interval CLI argument
+
+---
+
+**Last Updated**: 2026-02-26
+**Status**: Phase 1.1 Complete, Phase 2.1 (SimpleTracker) Complete. RTSP (Phase 1.2) next.
+**Next Action**: Implement `recognize_from_rtsp()` with reconnection logic
