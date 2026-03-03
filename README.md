@@ -45,23 +45,45 @@ Camera/Image → Face Detection → Embedding → Distance Matching → Identifi
    cd FacialRecognition
    ```
 
-2. **Create a virtual environment**
+2. **Create a conda environment** (recommended)
+
+   dlib requires C++ compilation when installed via pip, which often fails. Using conda avoids this by providing pre-built binaries.
+
    ```bash
-   python -m venv face_recognition_env
-
-   # Windows
-   face_recognition_env\Scripts\activate
-
-   # Linux/macOS
-   source face_recognition_env/bin/activate
+   conda create -n face python=3.12
+   conda activate face
    ```
 
-3. **Install dependencies**
+3. **Install dlib via conda**
+   ```bash
+   conda install -c conda-forge dlib=19.24.2
+   ```
+
+4. **Install remaining dependencies**
    ```bash
    pip install -r requirements.txt
    ```
 
-   > **Note**: dlib installation can be slow (compiles from source). On Windows, ensure Visual Studio Build Tools are installed first.
+   > **Important**: numpy must stay below 2.0 (already pinned in `requirements.txt`). dlib 19.24.2 is incompatible with numpy 2.x due to breaking ABI changes. If you see `Unsupported image type, must be 8bit gray or RGB image` errors, run `pip install "numpy>=1.20.0,<2.0"`.
+
+### Alternative: pip-only installation
+
+If you prefer not to use conda, you can use a standard venv, but you must install cmake first so dlib can compile from source:
+
+```bash
+python -m venv face_recognition_env
+
+# Windows
+face_recognition_env\Scripts\activate
+
+# Linux/macOS
+source face_recognition_env/bin/activate
+
+pip install cmake
+pip install -r requirements.txt
+```
+
+> **Windows note**: You may need Visual Studio Build Tools with "Desktop development with C++" instead of cmake. Alternatively, install dlib from a precompiled wheel (e.g., `pip install dlib-19.24.99-cp312-cp312-win_amd64.whl`).
 
 ## Project Structure
 
@@ -144,6 +166,47 @@ python recognize.py --mode image --source photo.jpg --output result.jpg
 
 **Controls:**
 - Press `q` to quit webcam mode
+
+### RTSP Stream Testing (Local)
+
+To test RTSP mode locally without an IP camera, use [MediaMTX](https://github.com/bluenviron/mediamtx) and [FFmpeg](https://ffmpeg.org/) to simulate a live stream from a video file.
+
+**Prerequisites:**
+```bash
+brew install mediamtx ffmpeg
+```
+
+**Setup:**
+
+1. Create a `mediamtx.yml` config file in the project directory:
+   ```yaml
+   paths:
+     all_others:
+       source: publisher
+   ```
+
+2. **Terminal 1** — Start MediaMTX:
+   ```bash
+   mediamtx
+   ```
+   You should see listeners open on RTSP (:8554), RTMP (:1935), and other ports.
+
+3. **Terminal 2** — Stream a video file on loop via RTMP:
+   ```bash
+   ffmpeg -re -stream_loop -1 -i test_video.mp4 -c:v libx264 -f flv rtmp://localhost:1935/live
+   ```
+   - `-re` reads the file at real-time speed
+   - `-stream_loop -1` loops the video indefinitely
+   - `-c:v libx264` re-encodes to H.264 (required for FLV/RTMP)
+
+4. **Terminal 3** — Run recognition against the RTSP output:
+   ```bash
+   python recognize.py --mode webcam --source "rtsp://localhost:8554/live" --threshold 0.7
+   ```
+
+MediaMTX bridges RTMP input to RTSP output on the same path name (`live`). The recognition app auto-detects the RTSP URL and uses the RTSP handler with reconnection logic.
+
+> **Note**: FPS will match your source video's frame rate (e.g., 20 FPS source = 20 FPS recognition). When the ffmpeg stream is stopped, the app will attempt reconnection up to 5 times before exiting gracefully.
 
 ## Utilities
 

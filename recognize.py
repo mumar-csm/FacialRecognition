@@ -213,7 +213,8 @@ def recognize_from_webcam(db_path: str,
                          threshold: float = 1.0,
                          cascade_path: str = "data/haarcascade_frontalface_default.xml",
                          resize_width: int = 640,
-                         fps_display: bool = True) -> None:
+                         fps_display: bool = True,
+                         tracker_interval: int = 30) -> None:
     """
     Real-time face recognition from webcam
 
@@ -224,6 +225,7 @@ def recognize_from_webcam(db_path: str,
         cascade_path: Path to Haar Cascade XML
         resize_width: Resize frame width for performance
         fps_display: Show FPS counter
+        tracker_interval: Frames between re-identification (default: 30)
     """
     # Load database
     print("[INFO] Loading face database...")
@@ -244,7 +246,7 @@ def recognize_from_webcam(db_path: str,
     prev_time = time.time()
 
     # Create tracker for optimized recognition
-    tracker = SimpleTracker(reidentify_interval=30)
+    tracker = SimpleTracker(reidentify_interval=tracker_interval)
 
     try:
         while True:
@@ -372,7 +374,8 @@ def recognize_from_video(video_path: str,
                         output_path: Optional[str] = None,
                         frame_skip: int = 0,
                         resize_width: int = 640,
-                        display: bool = False) -> Dict[str, Any]:
+                        display: bool = False,
+                        tracker_interval: int = 30) -> Dict[str, Any]:
     """
     Face recognition on video file
 
@@ -385,6 +388,7 @@ def recognize_from_video(video_path: str,
         frame_skip: Skip frames (0=all, 1=every other, 2=every 3rd, etc.)
         resize_width: Resize frame width for performance
         display: Show frames in real-time window during processing
+        tracker_interval: Frames between re-identification (default: 30)
 
     Returns:
         Dictionary with statistics:
@@ -450,7 +454,7 @@ def recognize_from_video(video_path: str,
     unique_identities = set()
 
     # Create tracker for optimized recognition
-    tracker = SimpleTracker(reidentify_interval=30)
+    tracker = SimpleTracker(reidentify_interval=tracker_interval)
 
     print("[INFO] Processing video with SimpleTracker optimization...")
 
@@ -543,6 +547,144 @@ def recognize_from_video(video_path: str,
     }
 
 
+def recognize_from_rtsp(rtsp_url: str,
+                        db_path: str,
+                        threshold: float = 1.0,
+                        cascade_path: str = "data/haarcascade_frontalface_default.xml",
+                        resize_width: int = 640,
+                        fps_display: bool = True,
+                        max_retries: int = 5,
+                        tracker_interval: int = 30) -> None:
+    """
+    Real-time face recognition from RTSP stream
+
+    Args:
+        rtsp_url: RTSP stream URL (e.g., rtsp://192.168.1.100:554/stream1)
+        db_path: Path to face database
+        threshold: Matching threshold
+        cascade_path: Path to Haar Cascade XML
+        resize_width: Resize frame width for performance
+        fps_display: Show FPS counter
+        max_retries: Maximum reconnection attempts before giving up
+        tracker_interval: Frames between re-identification (default: 30)
+    """
+    # Load face database (once, outside retry loop)
+    print("[INFO] Loading face database...")
+    known_encodings, labels = load_database(db_path)
+
+    # Configure FFMPEG for RTSP: TCP transport + 10 second timeout (once)
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;10000000"
+
+    # Reconnection loop
+    attempts = 0
+    user_quit = False
+
+    while attempts <= max_retries:
+        # Open RTSP stream with FFMPEG backend
+        if attempts == 0:
+            print(f"[INFO] Connecting to RTSP stream: {rtsp_url}")
+        else:
+            print(f"[INFO] Reconnection attempt {attempts}/{max_retries}...")
+
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not cap.isOpened():
+            cap.release()
+            attempts += 1
+            if attempts > max_retries:
+                break
+            print(f"[WARN] Connection failed, retrying in 2 seconds...")
+            time.sleep(2)
+            continue
+
+        # Connected — reset attempt counter
+        print("[INFO] RTSP stream connected successfully")
+        print("[INFO] Press 'q' to quit")
+        attempts = 0
+
+        # FPS tracking
+        fps_smooth = 0.0
+        prev_time = time.time()
+
+        # Create tracker for optimized recognition
+        tracker = SimpleTracker(reidentify_interval=tracker_interval)
+
+        try:
+            while True:
+                ret, frame = cap.read()
+
+                if not ret:
+                    print("[WARN] Lost RTSP stream")
+                    break
+
+                # Resize for performance
+                if resize_width and frame.shape[1] > resize_width:
+                    scale = resize_width / frame.shape[1]
+                    frame = cv2.resize(frame, (resize_width, int(frame.shape[0] * scale)))
+
+                # Convert BGR to RGB for face_recognition
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                # Fast detection every frame (uses cached classifier)
+                current_boxes = tracker.detect_faces(frame_rgb, cascade_path, DEFAULT_DETECTOR_PARAMS)
+
+                if tracker.should_reidentify(current_boxes):
+                    # Full recognition (expensive) - only when needed
+                    detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+                    # Update tracker cache
+                    tracker.update(
+                        boxes=[d.bbox for d in detections],
+                        labels=[d.label for d in detections],
+                        confidences=[d.confidence for d in detections],
+                        distances=[d.distance for d in detections]
+                    )
+                else:
+                    # Reuse cached identities (fast)
+                    detections = tracker.get_cached_detections(current_boxes)
+
+                # Calculate FPS
+                curr_time = time.time()
+                dt = curr_time - prev_time
+                prev_time = curr_time
+
+                if dt > 0:
+                    fps_instant = 1.0 / dt
+                    fps_smooth = 0.9 * fps_smooth + 0.1 * fps_instant
+
+                # Draw annotations
+                annotated = draw_annotations(frame, detections, fps_smooth if fps_display else None)
+
+                # Display
+                cv2.imshow("RTSP Face Recognition (Press 'q' to quit)", annotated)
+
+                # Exit on 'q'
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    print("[INFO] Quit signal received")
+                    user_quit = True
+                    break
+
+        finally:
+            cap.release()
+
+        # User pressed 'q' — exit completely
+        if user_quit:
+            break
+
+        # Stream lost — attempt reconnection
+        attempts += 1
+        if attempts <= max_retries:
+            print(f"[INFO] Attempting reconnection in 2 seconds...")
+            time.sleep(2)
+
+    cv2.destroyAllWindows()
+
+    if not user_quit and attempts > max_retries:
+        print(f"[ERROR] Failed to reconnect after {max_retries} attempts")
+
+    print("[INFO] RTSP stream released")
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
@@ -564,6 +706,9 @@ Examples:
 
   # Video file - save and watch in real-time
   python recognize.py --mode video --source meeting.mp4 --output annotated.mp4 --display --frame-skip 1
+
+  # RTSP stream (auto-detected from URL)
+  python recognize.py --mode webcam --source "rtsp://192.168.1.100:554/stream1" --threshold 0.7
         """
     )
 
@@ -572,7 +717,7 @@ Examples:
                        help="Recognition mode (default: webcam)")
 
     parser.add_argument("--source",
-                       help="Camera index (webcam mode) or image/video path")
+                       help="Camera index, RTSP URL (webcam mode), or image/video path")
 
     parser.add_argument("--database", default="data/known_faces.pkl",
                        help="Path to face database pickle file (default: data/known_faces.pkl)")
@@ -598,6 +743,12 @@ Examples:
     parser.add_argument("--display", action="store_true",
                        help="Display video frames in real-time window during processing (video mode)")
 
+    parser.add_argument("--tracker-interval", type=int, default=30,
+                       help="Frames between re-identification (default: 30, ~1 second at 30 FPS)")
+
+    parser.add_argument("--max-retries", type=int, default=5,
+                       help="Maximum RTSP reconnection attempts before giving up (default: 5)")
+
     return parser.parse_args()
 
 
@@ -607,16 +758,37 @@ def main():
 
     try:
         if args.mode == "webcam":
-            # Webcam mode
-            camera_index = int(args.source) if args.source else 0
-            recognize_from_webcam(
-                db_path=args.database,
-                camera_index=camera_index,
-                threshold=args.threshold,
-                cascade_path=args.cascade,
-                resize_width=args.resize_width,
-                fps_display=not args.no_display
-            )
+            source = args.source or "0"
+
+            # Auto-detect RTSP URLs
+            if source.startswith("rtsp://") or source.startswith("rtsps://"):
+                recognize_from_rtsp(
+                    rtsp_url=source,
+                    db_path=args.database,
+                    threshold=args.threshold,
+                    cascade_path=args.cascade,
+                    resize_width=args.resize_width,
+                    fps_display=not args.no_display,
+                    max_retries=args.max_retries,
+                    tracker_interval=args.tracker_interval
+                )
+            else:
+                # Webcam mode
+                try:
+                    camera_index = int(source)
+                except ValueError:
+                    print(f"[ERROR] Invalid camera source: '{source}'")
+                    print("[ERROR] Expected a camera index (e.g., 0, 1) or an RTSP URL (rtsp://...)")
+                    sys.exit(1)
+                recognize_from_webcam(
+                    db_path=args.database,
+                    camera_index=camera_index,
+                    threshold=args.threshold,
+                    cascade_path=args.cascade,
+                    resize_width=args.resize_width,
+                    fps_display=not args.no_display,
+                    tracker_interval=args.tracker_interval
+                )
 
         elif args.mode == "image":
             # Image mode
@@ -647,7 +819,8 @@ def main():
                 output_path=args.output,
                 frame_skip=args.frame_skip,
                 resize_width=args.resize_width,
-                display=args.display
+                display=args.display,
+                tracker_interval=args.tracker_interval
             )
 
     except KeyboardInterrupt:

@@ -70,36 +70,36 @@
 ### 1.2 RTSP Stream Support (3 days)
 
 #### Tasks:
-- [ ] **Add `recognize_from_rtsp()` function** in [recognize.py](recognize.py) (after video function)
-  - [ ] Load face database using `load_database()`
-  - [ ] Set FFMPEG environment variable: `OPENCV_FFMPEG_CAPTURE_OPTIONS`
-  - [ ] Configure: "rtsp_transport;tcp|timeout;10000000"
-  - [ ] Open RTSP stream with `cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)`
-  - [ ] Set buffer size: `cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)` for low latency
-  - [ ] Check if stream opened successfully
-  - [ ] Implement reconnection logic with retry attempts
-  - [ ] Add frame reading loop with error handling
-  - [ ] Process frames using existing `process_frame()` function
-  - [ ] Display with FPS counter
-  - [ ] Handle stream disconnection gracefully
-  - [ ] Exit on 'q' key press
+- [x] **Add `recognize_from_rtsp()` function** in [recognize.py](recognize.py) (after video function)
+  - [x] Load face database using `load_database()`
+  - [x] Set FFMPEG environment variable: `OPENCV_FFMPEG_CAPTURE_OPTIONS`
+  - [x] Configure: "rtsp_transport;tcp|timeout;10000000"
+  - [x] Open RTSP stream with `cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)`
+  - [x] Set buffer size: `cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)` for low latency
+  - [x] Check if stream opened successfully
+  - [x] Implement reconnection logic with retry attempts
+  - [x] Add frame reading loop with error handling
+  - [x] Process frames using existing `process_frame()` function
+  - [x] Display with FPS counter
+  - [x] Handle stream disconnection gracefully
+  - [x] Exit on 'q' key press
 
-- [ ] **Implement reconnection logic**
-  - [ ] Track reconnection attempts counter
-  - [ ] Sleep 2 seconds between reconnection attempts
-  - [ ] Release and recreate VideoCapture on failure
-  - [ ] Reset attempt counter on successful reconnection
-  - [ ] Exit after max attempts reached
+- [x] **Implement reconnection logic**
+  - [x] Track reconnection attempts counter
+  - [x] Sleep 2 seconds between reconnection attempts
+  - [x] Release and recreate VideoCapture on failure
+  - [x] Reset attempt counter on successful reconnection
+  - [x] Exit after max attempts reached
 
-- [ ] **Add `--tracker-interval` CLI argument** in [recognize.py](recognize.py) parse_args()
-  - [ ] Add argument: `--tracker-interval` type=int, default=30
-  - [ ] Document: "Frames between re-identification (default: 30, ~1 second at 30 FPS)"
-  - [ ] Pass to SimpleTracker(reidentify_interval=args.tracker_interval) in all modes
+- [x] **Add `--tracker-interval` CLI argument** in [recognize.py](recognize.py) parse_args()
+  - [x] Add argument: `--tracker-interval` type=int, default=30
+  - [x] Document: "Frames between re-identification (default: 30, ~1 second at 30 FPS)"
+  - [x] Pass to SimpleTracker(reidentify_interval=args.tracker_interval) in all modes
 
-- [ ] **Extend webcam mode to auto-detect RTSP** in [recognize.py](recognize.py) main() (lines 850-904)
-  - [ ] Check if source starts with "rtsp://"
-  - [ ] If RTSP URL detected, call `recognize_from_rtsp()` instead of webcam function
-  - [ ] Otherwise, parse as integer camera index and proceed normally
+- [x] **Extend webcam mode to auto-detect RTSP** in [recognize.py](recognize.py) main() (lines 850-904)
+  - [x] Check if source starts with "rtsp://"
+  - [x] If RTSP URL detected, call `recognize_from_rtsp()` instead of webcam function
+  - [x] Otherwise, parse as integer camera index and proceed normally
 
 #### Testing Checklist:
 - [ ] Test with public RTSP stream: `rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mp4`
@@ -165,8 +165,8 @@ Examples:
   - [x] If False: reuse cached labels and confidences
   - [x] Update tracker with current frame data
 
-- [ ] **Add tracker to RTSP mode**
-  - [ ] Duplicate tracker integration in RTSP function
+- [x] **Add tracker to RTSP mode**
+  - [x] Duplicate tracker integration in RTSP function
 
 #### Testing Checklist:
 - [x] Test webcam with tracker enabled
@@ -847,14 +847,20 @@ When `should_reidentify()` returns True, `tracker.detect_faces()` has already ru
 - ✅ **Removed dead code** — `detect_faces_only()` (superseded by `SimpleTracker.detect_faces()`)
 - ✅ **Extracted `DEFAULT_DETECTOR_PARAMS`** — single module-level constant replacing 3 inline dicts
 
+### Completed (2026-03-03):
+- ✅ **recognize_from_rtsp()** with SimpleTracker integration
+- ✅ **Reconnection logic** — 5 retries with 2s delay, graceful exit
+- ✅ **Auto-detect RTSP URLs** in main() webcam mode
+- ✅ **--tracker-interval CLI argument** — configurable re-id interval
+- ✅ **--max-retries CLI argument** — configurable reconnection attempts
+- ✅ **Pin numpy <2.0** — dlib 19.24.2 incompatible with numpy 2.x ABI
+- ✅ **README updated** — conda setup, numpy note, RTSP local testing guide
+
 ### Upcoming:
-- [ ] Add recognize_from_rtsp() function with SimpleTracker
-- [ ] Implement RTSP reconnection logic
-- [ ] Auto-detect RTSP URLs in main()
-- [ ] Add --tracker-interval CLI argument
+- [ ] Phase 1.2 testing checklist (public RTSP, authenticated, reconnection tests)
 
 ---
 
-**Last Updated**: 2026-02-26
-**Status**: Phase 1.1 Complete, Phase 2.1 (SimpleTracker) Complete. RTSP (Phase 1.2) next.
-**Next Action**: Implement `recognize_from_rtsp()` with reconnection logic
+**Last Updated**: 2026-03-03
+**Status**: Phase 1.1 Complete, Phase 2.1 (SimpleTracker) Complete, Phase 1.2 (RTSP) tasks complete (testing checklist pending).
+**Next Action**: Complete Phase 1.2 testing checklist, then Phase 2 optimizations
