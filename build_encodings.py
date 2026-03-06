@@ -124,12 +124,10 @@ def validate_and_load(image_path: str) -> Any:
         # Handle different channel configurations
         if img_bgr.ndim == 2:
             # Grayscale -> RGB
-            print(f"[DEBUG] Converting grayscale -> RGB for {image_path}")
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_GRAY2RGB)
         elif img_bgr.ndim == 3:
             if img_bgr.shape[2] == 4:
                 # RGBA/BGRA -> RGB (composite alpha on white background)
-                print(f"[DEBUG] Converting RGBA -> RGB for {image_path}")
                 # Extract alpha channel
                 bgr = img_bgr[:, :, :3]
                 alpha = img_bgr[:, :, 3:4] / 255.0
@@ -161,7 +159,6 @@ def validate_and_load(image_path: str) -> Any:
         print(f"[ERROR] Image too small (<100x100): {image_path} ({w}x{h})")
         return None
 
-    print(f"[DEBUG] load -> shape={img_rgb.shape} dtype={img_rgb.dtype} contiguous={img_rgb.flags['C_CONTIGUOUS']}")
     return img_rgb
 
 
@@ -241,7 +238,6 @@ def crop_with_margin(img: Any, box: Tuple[int, int, int, int],margin_pct: float 
 # Embedding computation
 
 def compute_embedding(face_roi: np.ndarray) -> Optional[List[float]]:
-    print(f"[DEBUG] ROI before encoding -> shape={getattr(face_roi,'shape',None)} dtype={getattr(face_roi,'dtype',None)}")
     # 1) Normalize channels (handle grayscale / RGBA)
     if face_roi is None:
         print("[ERROR] ROI is None")
@@ -273,10 +269,7 @@ def compute_embedding(face_roi: np.ndarray) -> Optional[List[float]]:
     # 3) Ensure C-contiguous for dlib
     face_roi = np.ascontiguousarray(face_roi)
 
-    # 4) Debug (optional)
-    print(f"[DEBUG] ROI normalized -> shape={face_roi.shape}, dtype={face_roi.dtype}, contiguous={face_roi.flags['C_CONTIGUOUS']}")
-
-    # 5) Encode
+    # 4) Encode
     encodings = face_recognition.face_encodings(face_roi)
     if not encodings:
         return None
@@ -363,6 +356,86 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def encode_single_image(args_tuple):
+    """
+    Worker function for multiprocessing. Processes one image end-to-end.
+
+    Args:
+        args_tuple: (ImageRecord, config_dict) — single tuple for pool.map()
+
+    Returns:
+        FaceRecord on success, or a string skip-reason on failure.
+    """
+    image_record, config = args_tuple
+    cascade_path = config["cascade_path"]
+    max_long_edge = config["max_long_edge"]
+    detector_params = config["detector"]
+
+    # 1. Validate and load
+    img = validate_and_load(image_record.image_path)
+    if img is None:
+        return "invalid"
+
+    # 2. Preprocess
+    img_prep = preprocess_image(img, max_long_edge=max_long_edge)
+
+    # 3. Detect faces — require exactly 1
+    boxes = detect_faces(img_prep, cascade_path, detector_params)
+    if len(boxes) != 1:
+        return "face_count"
+
+    # 4. Convert Haar (x, y, w, h) -> face_recognition (top, right, bottom, left)
+    x, y, w, h = boxes[0]
+    fr_box = (y, x + w, y + h, x)
+
+    # Pre-encode normalization
+    if not (img_prep.ndim == 3 and img_prep.shape[2] == 3 and img_prep.dtype == np.uint8):
+        if img_prep.ndim == 2:
+            img_prep = cv2.cvtColor(img_prep, cv2.COLOR_GRAY2RGB)
+        elif img_prep.ndim == 3 and img_prep.shape[2] == 4:
+            img_prep = cv2.cvtColor(img_prep, cv2.COLOR_RGBA2RGB)
+        img_prep = img_prep.astype(np.uint8)
+        img_prep = np.ascontiguousarray(img_prep)
+
+    # 5. Primary encoding path: known_face_locations
+    try:
+        encs = face_recognition.face_encodings(img_prep, known_face_locations=[fr_box])
+    except Exception:
+        encs = []
+
+    # 6. Fallback: manual crop
+    if not encs:
+        top, right, bottom, left = fr_box
+        H, W = img_prep.shape[:2]
+        top    = max(0, min(H - 1, top))
+        bottom = max(0, min(H,     bottom))
+        left   = max(0, min(W - 1, left))
+        right  = max(0, min(W,     right))
+
+        face_roi = img_prep[top:bottom, left:right]
+        if face_roi is None or face_roi.size == 0:
+            return "encoding_fail"
+
+        if face_roi.ndim == 2:
+            face_roi = cv2.cvtColor(face_roi, cv2.COLOR_GRAY2RGB)
+        elif face_roi.ndim == 3 and face_roi.shape[2] == 4:
+            face_roi = cv2.cvtColor(face_roi, cv2.COLOR_RGBA2RGB)
+        face_roi = face_roi.astype(np.uint8)
+        face_roi = np.ascontiguousarray(face_roi)
+
+        try:
+            encs = face_recognition.face_encodings(face_roi)
+        except Exception:
+            encs = []
+
+    # 7. Final check
+    if not encs:
+        return "encoding_fail"
+
+    encoding = encs[0].tolist()
+    return build_record(image_record.employee_id, image_record.image_path, encoding, boxes[0])
+
+
 def cli_main() -> None:
     """
     Orchestrates the end-to-end run:
@@ -419,123 +492,37 @@ def cli_main() -> None:
         print(f"[INFO] Discovered {len(images)} image(s).")
 
     
+    # Build worker config (includes cascade_path so workers can load their own classifier)
+    worker_config = {
+        "cascade_path": cascade_path,
+        "max_long_edge": max_long_edge,
+        "detector": config["detector"],
+    }
+    work_items = [(rec, worker_config) for rec in images]
+
+    from multiprocessing import Pool, cpu_count
+    num_workers = max(1, cpu_count() - 1)
+    total = len(work_items)
+    print(f"Encoding {total} images using {num_workers} workers...")
+
     new_records: List[FaceRecord] = []
     skipped_invalid = 0
     skipped_face_count = 0
     skipped_encoding_fail = 0
 
-    for rec in images:
-        img = validate_and_load(rec.image_path)
-        if img is None:
-            skipped_invalid += 1
-            if verbose:
-                print(f"[WARN] Invalid image: {rec.image_path}")
-            continue
-
-        img_prep = preprocess_image(img, max_long_edge=max_long_edge)
-
-        boxes = detect_faces(img_prep, cascade_path, config["detector"])
-
-        if len(boxes) != 1:
-            skipped_face_count += 1
-            if verbose:
-                print(f"[WARN] Expected exactly 1 face, found {len(boxes)}: {rec.image_path}")
-            continue
-
-        
-        # Convert Haar (x, y, w, h) -> face_recognition (top, right, bottom, left)
-        x, y, w, h = boxes[0]
-        fr_box = (y, x + w, y + h, x)
-
-        
-        # Strict pre-encode checks
-        if img_prep is None:
-            print(f"[ERROR] img_prep is None for {rec.image_path}")
-            skipped_invalid += 1
-            continue
-
-        
-        # Unconditional diagnostic: what are we about to pass to dlib?
-        print(
-            f"[DEBUG] pre-encode -> path={rec.image_path} "
-            f"shape={getattr(img_prep,'shape',None)} dtype={getattr(img_prep,'dtype',None)} "
-            f"contiguous={img_prep.flags['C_CONTIGUOUS']} fr_box={fr_box}"
-        )
-
-
-        if not (img_prep.ndim == 3 and img_prep.shape[2] == 3 and img_prep.dtype == np.uint8):
-            print(f"[ERROR] Pre-encode check failed: shape={getattr(img_prep,'shape',None)} dtype={getattr(img_prep,'dtype',None)}")
-            # Force normalization
-            if img_prep.ndim == 2:
-                img_prep = cv2.cvtColor(img_prep, cv2.COLOR_GRAY2RGB)
-            elif img_prep.ndim == 3 and img_prep.shape[2] == 4:
-                img_prep = cv2.cvtColor(img_prep, cv2.COLOR_RGBA2RGB)
-            elif img_prep.ndim == 3 and img_prep.shape[2] == 3:
-                # Already RGB from face_recognition.load_image_file() - no conversion needed
-                pass
-            img_prep = img_prep.astype(np.uint8)
-            img_prep = np.ascontiguousarray(img_prep)
-            print(f"[DEBUG] normalized img_prep -> shape={img_prep.shape} dtype={img_prep.dtype} contiguous={img_prep.flags['C_CONTIGUOUS']}")
-        
-        # --- Encode using known_face_locations (primary path) ---
-        try:
-            encs = face_recognition.face_encodings(img_prep, known_face_locations=[fr_box])
-            print(f"[DEBUG] encodings from known_face_locations: {len(encs)}")
-        except Exception as e:
-            print(f"[ERROR] face_encodings failed (known_face_locations) for {rec.image_path}: {type(e).__name__}: {e}")
-            encs = []
-
-        # If primary path failed or returned none, try manual crop fallback
-        if not encs:
-            top, right, bottom, left = fr_box
-            # Clamp to image bounds
-            H, W = img_prep.shape[:2]
-            top    = max(0, min(H-1, top))
-            bottom = max(0, min(H,   bottom))
-            left   = max(0, min(W-1, left))
-            right  = max(0, min(W,   right))
-
-            # Safe ROI slice
-            face_roi = img_prep[top:bottom, left:right]
-            print(f"[DEBUG] ROI slice -> shape={getattr(face_roi,'shape',None)} dtype={getattr(face_roi,'dtype',None)}")
-
-            # Fallback normalization for ROI (ensure RGB uint8, contiguous)
-            if face_roi is None or face_roi.size == 0:
-                print(f"[WARN] Empty ROI after clamp for {rec.image_path}")
+    with Pool(num_workers) as pool:
+        for i, result in enumerate(pool.imap_unordered(encode_single_image, work_items), 1):
+            print(f"\rProcessed {i}/{total}", end="", flush=True)
+            if isinstance(result, FaceRecord):
+                new_records.append(result)
+            elif result == "invalid":
+                skipped_invalid += 1
+            elif result == "face_count":
+                skipped_face_count += 1
+            elif result == "encoding_fail":
                 skipped_encoding_fail += 1
-                continue
-            if face_roi.ndim == 2:
-                face_roi = cv2.cvtColor(face_roi, cv2.COLOR_GRAY2RGB)
-            elif face_roi.ndim == 3 and face_roi.shape[2] == 4:
-                face_roi = cv2.cvtColor(face_roi, cv2.COLOR_RGBA2RGB)
-            elif face_roi.ndim == 3 and face_roi.shape[2] == 3:
-                # Already RGB from face_recognition.load_image_file() - no conversion needed
-                # Note: face_recognition.load_image_file yields RGB;
-                # cv2.resize and array slicing do not change channel order
-                pass
 
-            face_roi = face_roi.astype(np.uint8)
-            face_roi = np.ascontiguousarray(face_roi)
-            print(f"[DEBUG] ROI normalized -> shape={face_roi.shape} dtype={face_roi.dtype} contiguous={face_roi.flags['C_CONTIGUOUS']}")
-
-            # Try encoding on cropped ROI (no known_face_locations)
-            try:
-                encs = face_recognition.face_encodings(face_roi)
-                print(f"[DEBUG] encodings from ROI: {len(encs)}")
-            except Exception as e:
-                print(f"[ERROR] face_encodings failed (ROI) for {rec.image_path}: {type(e).__name__}: {e}")
-                encs = []
-
-        # Final check
-        if not encs:
-            skipped_encoding_fail += 1
-            if verbose:
-                print(f"[WARN] Encoding failed after both paths: {rec.image_path}")
-            continue
-
-        # Success: pick the first encoding and append
-        encoding = encs[0].tolist()
-        new_records.append(build_record(rec.employee_id, rec.image_path, encoding, boxes[0]))
+    print()  # newline after progress
 
 
     # If incremental merge requested and output exists (and not rebuilding), merge

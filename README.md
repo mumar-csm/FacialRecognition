@@ -269,3 +269,24 @@ Key parameters in `build_encodings.py` that can be tuned:
 | `min_size` | Minimum face size in pixels | `(60, 60)` |
 | `crop_margin` | Margin around detected face | `0.20` |
 
+### Threshold Tuning
+
+Use `tune_threshold.py` to analyze your face database and find the optimal `--threshold` value:
+
+```bash
+pip install matplotlib scikit-learn
+python tune_threshold.py --database data/known_faces.pkl
+```
+
+This compares all pairwise distances between encodings and outputs:
+- **Impostor distances** (different people) — statistics and distribution histogram
+- **Genuine distances** (same person, different photos) — requires multiple photos per person
+- **Recommended thresholds** — strict, balanced (EER), and lenient options
+
+**Current findings** (10 employees, 1 photo each — impostor-only analysis):
+- Impostor distance range: 0.585 – 1.004
+- Recommended maximum threshold: **0.58** (any higher risks false matches)
+- Re-run after adding multiple photos per person for full EER-based recommendations
+
+The tool saves a `threshold_analysis.png` plot for visual inspection.
+

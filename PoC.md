@@ -102,21 +102,21 @@
   - [x] Otherwise, parse as integer camera index and proceed normally
 
 #### Testing Checklist:
-- [ ] Test with public RTSP stream: `rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mp4`
-- [ ] Verify stream displays correctly
-- [ ] Verify face recognition works on RTSP stream
+- [x] Test with local RTSP stream (using MediaMTX + FFmpeg)
+- [x] Verify stream displays correctly
+- [x] Verify face recognition works on RTSP stream
 - [ ] Test with authenticated RTSP (username:password in URL)
-- [ ] Test reconnection: unplug network cable mid-stream
-- [ ] Verify automatic reconnection works
+- [x] Test reconnection: unplug network cable mid-stream
+- [x] Verify automatic reconnection works
 - [ ] Test with real IP camera (if available)
-- [ ] Measure latency from stream to display
+- [x] Measure latency from stream to display
 
 #### Success Criteria:
-- [ ] RTSP streams connect successfully
+- [x] RTSP streams connect successfully
 - [ ] Authentication works (if applicable)
-- [ ] Reconnection logic recovers from network interruptions
-- [ ] Latency is acceptable (<500ms with buffer=1)
-- [ ] Face recognition accuracy matches webcam mode
+- [x] Reconnection logic recovers from network interruptions
+- [x] Latency is acceptable (<500ms with buffer=1)
+- [x] Face recognition accuracy matches webcam mode
 
 #### RTSP URL Format Reference:
 ```
@@ -175,64 +175,59 @@ Examples:
 - [x] Verify re-identification occurs every 30 frames (1 second at 30 FPS)
 - [x] Measure FPS before tracker: baseline
 - [x] Measure FPS after tracker: should be 3-5x higher
-- [ ] Test with multiple faces in frame
+- [x] Test with multiple faces in frame
 - [x] Verify no crashes or memory leaks during long runs
 
 #### Success Criteria:
-- [ ] Real-time FPS improves by 3-5x
-- [ ] Identity labels remain stable for stationary faces
-- [ ] System re-identifies when faces move significantly
-- [ ] No degradation in recognition accuracy
+- [x] Real-time FPS improves by 3-5x
+- [x] Identity labels remain stable for stationary faces
+- [x] System re-identifies when faces move significantly
+- [x] No degradation in recognition accuracy
 
 ---
 
 ### 2.2 Multiprocessing for Enrollment (1 day)
 
 #### Tasks:
-- [ ] **Create worker function** in [build_encodings.py](build_encodings.py) (before cli_main)
-  - [ ] Define `encode_single_image(args)` function
-  - [ ] Unpack args: (image_record, config_dict)
-  - [ ] Move existing encoding logic from cli_main() (lines ~427-527 in build_encodings.py) into this function
-  - [ ] Load and validate image
-  - [ ] Preprocess image
-  - [ ] Detect faces
-  - [ ] Validate single face
-  - [ ] Encode face
-  - [ ] Return FaceRecord or None on error
-  - [ ] Ensure all errors are caught and logged
+- [x] **Create worker function** in [build_encodings.py](build_encodings.py) (before cli_main)
+  - [x] Define `encode_single_image(args)` function
+  - [x] Unpack args: (image_record, config_dict)
+  - [x] Move existing encoding logic from cli_main() into this function
+  - [x] Load and validate image
+  - [x] Preprocess image
+  - [x] Detect faces
+  - [x] Validate single face
+  - [x] Encode face
+  - [x] Return FaceRecord or skip-reason string on error
+  - [x] Ensure all errors are caught and logged
 
-- [ ] **Modify cli_main()** in [build_encodings.py](build_encodings.py) (lines 366-563)
-  - [ ] Import: `from multiprocessing import Pool, cpu_count`
-  - [ ] Prepare work items: list of (image_record, config_dict) tuples
-  - [ ] Calculate num_workers: `max(1, cpu_count() - 1)` (leave one core free)
-  - [ ] Print: "Using N worker processes"
-  - [ ] Create Pool: `with Pool(num_workers) as pool:`
-  - [ ] Execute: `results = pool.map(encode_single_image, work_items)`
-  - [ ] Filter None results: `new_records = [r for r in results if r is not None]`
-  - [ ] Continue with existing serialization logic
+- [x] **Modify cli_main()** in [build_encodings.py](build_encodings.py)
+  - [x] Import: `from multiprocessing import Pool, cpu_count`
+  - [x] Prepare work items: list of (image_record, config_dict) tuples
+  - [x] Calculate num_workers: `max(1, cpu_count() - 1)` (leave one core free)
+  - [x] Print: "Encoding N images using M workers..."
+  - [x] Create Pool: `with Pool(num_workers) as pool:`
+  - [x] Execute: `pool.imap_unordered(encode_single_image, work_items)`
+  - [x] Collect results and count skip reasons
+  - [x] Continue with existing serialization logic
 
-- [ ] **Handle progress reporting**
-  - [ ] Consider using `pool.imap()` with progress bar if needed
-  - [ ] Or simple: print total completed after pool.map() finishes
+- [x] **Handle progress reporting**
+  - [x] Used `pool.imap_unordered()` with in-place progress counter
+  - [x] Removed worker debug prints to keep progress output clean
 
 #### Testing Checklist:
-- [ ] Time enrollment with old code (sequential): record baseline
-- [ ] Time enrollment with new code (parallel): compare
-- [ ] Verify: speedup should be 4-8x on 8-core CPU
-- [ ] Verify: output .pkl file is identical to sequential version
-  - [ ] Use `inspect_pkl.py` to compare encodings
-  - [ ] Check: same number of records
-  - [ ] Check: same labels
-  - [ ] Check: encoding values match (or very close due to floating point)
-- [ ] Test with small dataset (10 images): verify correctness
-- [ ] Test with large dataset (100+ images): verify performance gain
-- [ ] Monitor CPU usage: should spike to ~90% across all cores
+- [x] Verify: output .pkl has same number of records and labels as sequential version
+- [x] Test with small dataset (10 images): verify correctness (10 encoded, 0 skipped)
+- [x] No crashes or deadlocks
+- [ ] Time sequential vs parallel (deferred — not meaningful with 10 images)
+- [ ] Test with large dataset (100+ images) when available
+- [ ] Monitor CPU usage with larger dataset
 
 #### Success Criteria:
-- [ ] Enrollment time reduced by 4-8x
-- [ ] Output database is identical to sequential version
-- [ ] No crashes or deadlocks
-- [ ] CPU utilization is high during processing
+- [ ] Enrollment time reduced by 4-8x (needs larger dataset to measure)
+- [x] Output database matches sequential version (same record count and labels)
+- [x] No crashes or deadlocks
+- [ ] CPU utilization is high during processing (needs larger dataset to observe)
 
 ---
 
@@ -241,59 +236,42 @@ Examples:
 > **Scope note**: This is a one-time analysis tool, not a runtime dependency. Consider implementing as a Jupyter notebook instead of a CLI script to avoid adding matplotlib/scikit-learn as permanent project dependencies. The output (recommended threshold value) is what matters — the tool itself only needs to run once per database rebuild.
 
 #### Tasks:
-- [ ] **Create tune_threshold.py script** (new file, or Jupyter notebook)
-  - [ ] Add shebang and docstring
-  - [ ] Import: pickle, numpy, matplotlib, sklearn
-  - [ ] Add `compute_distances(encodings, labels)` function
-    - [ ] Initialize genuine_dists and impostor_dists lists
-    - [ ] Double loop: compare all pairs of encodings
-    - [ ] If same label: append to genuine_dists
-    - [ ] If different label: append to impostor_dists
-    - [ ] Return both lists
-  - [ ] Add `plot_distribution(genuine, impostor, output_path)` function
-    - [ ] Create figure with 2 subplots (1 row, 2 columns)
-    - [ ] Subplot 1: Histogram of genuine and impostor distances
-    - [ ] Use bins=50, alpha=0.7
-    - [ ] Label axes and add legend
-    - [ ] Subplot 2: ROC curve
-    - [ ] Compute TPR, FPR, thresholds using sklearn
-    - [ ] Plot ROC curve with AUC score
-    - [ ] Save figure to output_path
-  - [ ] Add `recommend_threshold(genuine, impostor)` function
-    - [ ] Calculate EER (Equal Error Rate)
-    - [ ] Calculate strict threshold: 99.9th percentile of genuine
-    - [ ] Calculate lenient threshold: 0.1st percentile of impostor
-    - [ ] Return dict with all three thresholds
-  - [ ] Add main section
-    - [ ] Parse args for database path
-    - [ ] Load database
-    - [ ] Compute distances
-    - [ ] Print statistics: mean, std for genuine and impostor
-    - [ ] Recommend thresholds
-    - [ ] Print recommendations
-    - [ ] Plot distribution
+- [x] **Create tune_threshold.py script** (CLI script)
+  - [x] Add docstring
+  - [x] Import: pickle, numpy, matplotlib, euclideanDist
+  - [x] Add `compute_distances(encodings, labels)` function
+    - [x] All-pairs comparison using itertools.combinations
+    - [x] Separate into genuine_dists and impostor_dists
+    - [x] Return both lists
+  - [x] Add `plot_distribution(genuine, impostor, output_path)` function
+    - [x] Histogram of genuine and impostor distances (bins=50, alpha=0.7)
+    - [x] ROC curve with AUC (when genuine pairs available)
+    - [x] Graceful fallback if matplotlib not installed
+  - [x] Add `recommend_threshold(genuine, impostor)` function
+    - [x] EER threshold (when genuine pairs available)
+    - [x] Strict threshold: 99.9th percentile of genuine
+    - [x] Lenient threshold: 0.1st percentile of impostor
+    - [x] Handles edge case: no genuine pairs (impostor-only analysis)
+  - [x] Add main section with argparse, stats, recommendations, plot
 
-- [ ] **Update requirements.txt**
-  - [ ] Add: `matplotlib>=3.5.0`
-  - [ ] Add: `scikit-learn>=1.0.0`
+- [x] **Update requirements.txt**
+  - [x] Add: `matplotlib>=3.5.0`
+  - [x] Add: `scikit-learn>=1.0.0`
 
 #### Testing Checklist:
-- [ ] Run: `python tune_threshold.py`
-- [ ] Verify: no errors
-- [ ] Check output: threshold_analysis.png created
-- [ ] Open plot: verify histogram shows separation between genuine/impostor
-- [ ] Check ROC curve: AUC should be >0.95 for good embeddings
-- [ ] Verify recommendations make sense:
-  - [ ] Strict threshold < Balanced threshold < Lenient threshold
-  - [ ] Genuine mean << Impostor mean (good separation)
-- [ ] Test with different databases
-- [ ] Document recommended threshold in README
+- [x] Run: `python tune_threshold.py --database data/known_faces.pkl`
+- [x] Verify: no errors
+- [x] Check output: threshold_analysis.png created
+- [x] Open plot: verify histogram shows impostor distribution
+- [ ] Check ROC curve: AUC >0.95 (deferred — needs genuine pairs)
+- [ ] Verify EER recommendation (deferred — needs genuine pairs)
+- [x] Document recommended threshold in README
 
 #### Success Criteria:
-- [ ] Script runs without errors
-- [ ] Plots are clear and informative
-- [ ] Recommendations are data-driven and actionable
-- [ ] User can choose threshold based on use case (strict vs lenient)
+- [x] Script runs without errors
+- [x] Plots are clear and informative
+- [x] Recommendations are data-driven and actionable
+- [x] User can choose threshold based on use case (strict vs lenient)
 
 ---
 
@@ -861,6 +839,6 @@ When `should_reidentify()` returns True, `tracker.detect_faces()` has already ru
 
 ---
 
-**Last Updated**: 2026-03-03
-**Status**: Phase 1.1 Complete, Phase 2.1 (SimpleTracker) Complete, Phase 1.2 (RTSP) tasks complete (testing checklist pending).
-**Next Action**: Complete Phase 1.2 testing checklist, then Phase 2 optimizations
+**Last Updated**: 2026-03-06
+**Status**: Phase 1 Complete (auth deferred), Phase 2 Complete (perf testing deferred — needs larger dataset, ROC/EER deferred — needs multiple photos per person).
+**Next Action**: Phase 3 (Library Modernization — RetinaFace + ArcFace)
