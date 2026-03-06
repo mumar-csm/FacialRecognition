@@ -185,13 +185,13 @@ brew install mediamtx ffmpeg
        source: publisher
    ```
 
-2. **Terminal 1** — Start MediaMTX:
+2. **Terminal 1** — Start MediaMTX: (run it from the directory where the mediamtx.yml file lives)
    ```bash
    mediamtx
    ```
    You should see listeners open on RTSP (:8554), RTMP (:1935), and other ports.
 
-3. **Terminal 2** — Stream a video file on loop via RTMP:
+3. **Terminal 2** — Stream a video file on loop via RTMP: (run it from the directory where the video file in question lives)
    ```bash
    ffmpeg -re -stream_loop -1 -i test_video.mp4 -c:v libx264 -f flv rtmp://localhost:1935/live
    ```
