@@ -18,7 +18,8 @@ import face_recognition
 import pickle
 import hashlib
 from datetime import datetime
-import face_recognition
+
+from detector_factory import create_detector, align_face
 
 #  Data models/schemas
 
@@ -353,7 +354,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild", action="store_true", help="Ignore any existing DB and rebuild from scratch")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--incremental", action="store_true", help="(Future) Merge new images into existing DB")
+    parser.add_argument("--detector", choices=["haar", "retinaface"], default="haar",
+                       help="Face detection backend (default: haar)")
+    parser.add_argument("--align", action="store_true",
+                       help="Enable landmark-based face alignment (requires retinaface detector)")
     return parser.parse_args()
+
+
+# Module-level detector cache for multiprocessing workers.
+# Each worker process creates its own detector on first use.
+_worker_detector = None
+
+
+def _get_worker_detector(config):
+    """Lazily create/cache a detector in the current worker process."""
+    global _worker_detector
+    if _worker_detector is None:
+        _worker_detector = create_detector(
+            config["detector_type"],
+            cascade_path=config.get("cascade_path"),
+            params=config.get("detector_params"),
+        )
+    return _worker_detector
 
 
 def encode_single_image(args_tuple):
@@ -367,9 +389,10 @@ def encode_single_image(args_tuple):
         FaceRecord on success, or a string skip-reason on failure.
     """
     image_record, config = args_tuple
-    cascade_path = config["cascade_path"]
     max_long_edge = config["max_long_edge"]
-    detector_params = config["detector"]
+    do_align = config.get("do_align", False)
+
+    detector = _get_worker_detector(config)
 
     # 1. Validate and load
     img = validate_and_load(image_record.image_path)
@@ -379,14 +402,12 @@ def encode_single_image(args_tuple):
     # 2. Preprocess
     img_prep = preprocess_image(img, max_long_edge=max_long_edge)
 
-    # 3. Detect faces — require exactly 1
-    boxes = detect_faces(img_prep, cascade_path, detector_params)
-    if len(boxes) != 1:
+    # 3. Detect faces via detector — require exactly 1
+    detections = detector.detect(img_prep)
+    if len(detections) != 1:
         return "face_count"
 
-    # 4. Convert Haar (x, y, w, h) -> face_recognition (top, right, bottom, left)
-    x, y, w, h = boxes[0]
-    fr_box = (y, x + w, y + h, x)
+    (x, y, w, h), landmarks = detections[0]
 
     # Pre-encode normalization
     if not (img_prep.ndim == 3 and img_prep.shape[2] == 3 and img_prep.dtype == np.uint8):
@@ -397,43 +418,40 @@ def encode_single_image(args_tuple):
         img_prep = img_prep.astype(np.uint8)
         img_prep = np.ascontiguousarray(img_prep)
 
-    # 5. Primary encoding path: known_face_locations
-    try:
-        encs = face_recognition.face_encodings(img_prep, known_face_locations=[fr_box])
-    except Exception:
-        encs = []
+    # 4. Encode: aligned path or standard path
+    if do_align and landmarks is not None:
+        aligned = align_face(img_prep, landmarks)
+        aligned = np.ascontiguousarray(aligned)
+        try:
+            encs = face_recognition.face_encodings(aligned)
+        except Exception:
+            encs = []
+    else:
+        # Standard path: pass bbox to face_recognition
+        fr_box = (y, x + w, y + h, x)
+        try:
+            encs = face_recognition.face_encodings(img_prep, known_face_locations=[fr_box])
+        except Exception:
+            encs = []
 
-    # 6. Fallback: manual crop
+    # 5. Fallback: manual crop
     if not encs:
-        top, right, bottom, left = fr_box
-        H, W = img_prep.shape[:2]
-        top    = max(0, min(H - 1, top))
-        bottom = max(0, min(H,     bottom))
-        left   = max(0, min(W - 1, left))
-        right  = max(0, min(W,     right))
-
-        face_roi = img_prep[top:bottom, left:right]
+        face_roi = img_prep[y:y+h, x:x+w]
         if face_roi is None or face_roi.size == 0:
             return "encoding_fail"
 
-        if face_roi.ndim == 2:
-            face_roi = cv2.cvtColor(face_roi, cv2.COLOR_GRAY2RGB)
-        elif face_roi.ndim == 3 and face_roi.shape[2] == 4:
-            face_roi = cv2.cvtColor(face_roi, cv2.COLOR_RGBA2RGB)
-        face_roi = face_roi.astype(np.uint8)
-        face_roi = np.ascontiguousarray(face_roi)
-
+        face_roi = np.ascontiguousarray(face_roi.astype(np.uint8))
         try:
             encs = face_recognition.face_encodings(face_roi)
         except Exception:
             encs = []
 
-    # 7. Final check
+    # 6. Final check
     if not encs:
         return "encoding_fail"
 
     encoding = encs[0].tolist()
-    return build_record(image_record.employee_id, image_record.image_path, encoding, boxes[0])
+    return build_record(image_record.employee_id, image_record.image_path, encoding, (x, y, w, h))
 
 
 def cli_main() -> None:
@@ -492,11 +510,13 @@ def cli_main() -> None:
         print(f"[INFO] Discovered {len(images)} image(s).")
 
     
-    # Build worker config (includes cascade_path so workers can load their own classifier)
+    # Build worker config (includes all info workers need to create their own detector)
     worker_config = {
         "cascade_path": cascade_path,
         "max_long_edge": max_long_edge,
-        "detector": config["detector"],
+        "detector_type": args.detector,
+        "detector_params": config["detector"],
+        "do_align": args.align,
     }
     work_items = [(rec, worker_config) for rec in images]
 

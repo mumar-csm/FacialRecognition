@@ -25,6 +25,9 @@ from build_encodings import EncodingsDB
 from tracker import SimpleTracker, Detection, DEFAULT_DETECTOR_PARAMS
 from visualization import draw_annotations
 
+# Import detector factory
+from detector_factory import create_detector, align_face, FaceDetector
+
 
 def load_database(db_path: str) -> Tuple[List[List[float]], List[str]]:
     """
@@ -106,51 +109,36 @@ def find_best_match(unknown_encoding: np.ndarray,
 
 
 def detect_and_encode_faces(frame: np.ndarray,
-                            cascade_path: str,
-                            detector_params: Dict[str, Any]) -> List[Tuple[Tuple[int, int, int, int], np.ndarray]]:
+                            detector: FaceDetector,
+                            do_align: bool = False) -> List[Tuple[Tuple[int, int, int, int], np.ndarray]]:
     """
     Detect faces in frame and compute embeddings
 
     Args:
         frame: RGB image (numpy array)
-        cascade_path: Path to haarcascade XML
-        detector_params: Detection parameters (scale_factor, min_neighbors, min_size)
+        detector: A FaceDetector instance (HaarDetector, RetinaFaceDetector, etc.)
+        do_align: If True and landmarks are available, align face before encoding
 
     Returns:
         List of (bbox, encoding) tuples
         bbox: (x, y, w, h)
         encoding: 128-d numpy array
     """
-    # Load Haar Cascade
-    if not os.path.isfile(cascade_path):
-        raise FileNotFoundError(f"Cascade file not found: {cascade_path}")
-
-    classifier = cv2.CascadeClassifier(cascade_path)
-    if classifier.empty():
-        raise RuntimeError(f"Failed to load cascade: {cascade_path}")
-
-    # Convert to grayscale for detection
-    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-
-    # Detect faces
-    boxes = classifier.detectMultiScale(
-        gray,
-        scaleFactor=detector_params.get("scale_factor", 1.1),
-        minNeighbors=detector_params.get("min_neighbors", 5),
-        minSize=detector_params.get("min_size", (60, 60)),
-        flags=cv2.CASCADE_SCALE_IMAGE
-    )
-
+    detections = detector.detect(frame)
     results = []
 
-    # Encode each detected face
-    for (x, y, w, h) in boxes:
-        # Convert Haar bbox (x,y,w,h) to face_recognition format (top, right, bottom, left)
-        fr_box = (y, x + w, y + h, x)
-
+    for (x, y, w, h), landmarks in detections:
         try:
-            # Try encoding with known face location first
-            encodings = face_recognition.face_encodings(frame, known_face_locations=[fr_box])
+            if do_align and landmarks is not None:
+                # Align face using landmarks, then encode the aligned crop
+                aligned = align_face(frame, landmarks)
+                aligned = np.ascontiguousarray(aligned)
+                encodings = face_recognition.face_encodings(aligned)
+            else:
+                # Standard path: pass bbox to face_recognition
+                # Convert (x,y,w,h) to face_recognition format (top, right, bottom, left)
+                fr_box = (y, x + w, y + h, x)
+                encodings = face_recognition.face_encodings(frame, known_face_locations=[fr_box])
 
             if encodings:
                 results.append(((x, y, w, h), encodings[0]))
@@ -174,9 +162,9 @@ def detect_and_encode_faces(frame: np.ndarray,
 def process_frame(frame: np.ndarray,
                  known_encodings: List[List[float]],
                  labels: List[str],
-                 cascade_path: str,
+                 detector: FaceDetector,
                  threshold: float = 1.0,
-                 detector_params: Optional[Dict[str, Any]] = None) -> List[Detection]:
+                 do_align: bool = False) -> List[Detection]:
     """
     Process a single frame: detect faces, encode, and match
 
@@ -184,18 +172,15 @@ def process_frame(frame: np.ndarray,
         frame: RGB image (numpy array)
         known_encodings: List of known face embeddings
         labels: List of employee IDs
-        cascade_path: Path to Haar Cascade XML
+        detector: A FaceDetector instance
         threshold: Matching threshold
-        detector_params: Detection parameters
+        do_align: If True, align faces using landmarks before encoding
 
     Returns:
         List of Detection objects
     """
-    if detector_params is None:
-        detector_params = DEFAULT_DETECTOR_PARAMS
-
     # Detect and encode faces
-    face_data = detect_and_encode_faces(frame, cascade_path, detector_params)
+    face_data = detect_and_encode_faces(frame, detector, do_align)
 
     # Match each face
     detections = []
@@ -214,7 +199,9 @@ def recognize_from_webcam(db_path: str,
                          cascade_path: str = "data/haarcascade_frontalface_default.xml",
                          resize_width: int = 640,
                          fps_display: bool = True,
-                         tracker_interval: int = 30) -> None:
+                         tracker_interval: int = 30,
+                         detector_type: str = "haar",
+                         do_align: bool = False) -> None:
     """
     Real-time face recognition from webcam
 
@@ -226,6 +213,8 @@ def recognize_from_webcam(db_path: str,
         resize_width: Resize frame width for performance
         fps_display: Show FPS counter
         tracker_interval: Frames between re-identification (default: 30)
+        detector_type: Detection backend ("haar" or "retinaface")
+        do_align: Enable landmark-based face alignment
     """
     # Load database
     print("[INFO] Loading face database...")
@@ -245,7 +234,8 @@ def recognize_from_webcam(db_path: str,
     fps_smooth = 0.0
     prev_time = time.time()
 
-    # Create tracker for optimized recognition
+    # Create detector and tracker
+    detector = create_detector(detector_type, cascade_path=cascade_path)
     tracker = SimpleTracker(reidentify_interval=tracker_interval)
 
     try:
@@ -263,12 +253,12 @@ def recognize_from_webcam(db_path: str,
             # Convert BGR to RGB for face_recognition
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Fast detection every frame (uses cached classifier)
-            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, DEFAULT_DETECTOR_PARAMS)
+            # Fast detection every frame
+            current_boxes = tracker.detect_faces(frame_rgb, detector)
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
-                detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
                 # Update tracker cache
                 tracker.update(
                     boxes=[d.bbox for d in detections],
@@ -311,7 +301,9 @@ def recognize_from_image(image_path: str,
                         threshold: float = 1.0,
                         cascade_path: str = "data/haarcascade_frontalface_default.xml",
                         output_path: Optional[str] = None,
-                        display: bool = True) -> List[Detection]:
+                        display: bool = True,
+                        detector_type: str = "haar",
+                        do_align: bool = False) -> List[Detection]:
     """
     Face recognition on a single image
 
@@ -322,6 +314,8 @@ def recognize_from_image(image_path: str,
         cascade_path: Path to Haar Cascade XML
         output_path: Optional path to save annotated image
         display: Display result window
+        detector_type: Detection backend ("haar" or "retinaface")
+        do_align: Enable landmark-based face alignment
 
     Returns:
         List of Detection objects
@@ -344,7 +338,8 @@ def recognize_from_image(image_path: str,
 
     # Process frame
     print("[INFO] Processing image...")
-    detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+    detector = create_detector(detector_type, cascade_path=cascade_path)
+    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
 
     print(f"[INFO] Detected {len(detections)} face(s)")
     for det in detections:
@@ -375,7 +370,9 @@ def recognize_from_video(video_path: str,
                         frame_skip: int = 0,
                         resize_width: int = 640,
                         display: bool = False,
-                        tracker_interval: int = 30) -> Dict[str, Any]:
+                        tracker_interval: int = 30,
+                        detector_type: str = "haar",
+                        do_align: bool = False) -> Dict[str, Any]:
     """
     Face recognition on video file
 
@@ -389,6 +386,8 @@ def recognize_from_video(video_path: str,
         resize_width: Resize frame width for performance
         display: Show frames in real-time window during processing
         tracker_interval: Frames between re-identification (default: 30)
+        detector_type: Detection backend ("haar" or "retinaface")
+        do_align: Enable landmark-based face alignment
 
     Returns:
         Dictionary with statistics:
@@ -453,7 +452,8 @@ def recognize_from_video(video_path: str,
     faces_detected = 0
     unique_identities = set()
 
-    # Create tracker for optimized recognition
+    # Create detector and tracker for optimized recognition
+    detector = create_detector(detector_type, cascade_path=cascade_path)
     tracker = SimpleTracker(reidentify_interval=tracker_interval)
 
     print("[INFO] Processing video with SimpleTracker optimization...")
@@ -477,12 +477,12 @@ def recognize_from_video(video_path: str,
             # Convert BGR to RGB for face_recognition
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Fast detection every frame (uses cached classifier)
-            current_boxes = tracker.detect_faces(frame_rgb, cascade_path, DEFAULT_DETECTOR_PARAMS)
+            # Fast detection every frame
+            current_boxes = tracker.detect_faces(frame_rgb, detector)
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
-                detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
                 # Update tracker cache
                 tracker.update(
                     boxes=[d.bbox for d in detections],
@@ -554,7 +554,9 @@ def recognize_from_rtsp(rtsp_url: str,
                         resize_width: int = 640,
                         fps_display: bool = True,
                         max_retries: int = 5,
-                        tracker_interval: int = 30) -> None:
+                        tracker_interval: int = 30,
+                        detector_type: str = "haar",
+                        do_align: bool = False) -> None:
     """
     Real-time face recognition from RTSP stream
 
@@ -567,6 +569,8 @@ def recognize_from_rtsp(rtsp_url: str,
         fps_display: Show FPS counter
         max_retries: Maximum reconnection attempts before giving up
         tracker_interval: Frames between re-identification (default: 30)
+        detector_type: Detection backend ("haar" or "retinaface")
+        do_align: Enable landmark-based face alignment
     """
     # Load face database (once, outside retry loop)
     print("[INFO] Loading face database...")
@@ -574,6 +578,9 @@ def recognize_from_rtsp(rtsp_url: str,
 
     # Configure FFMPEG for RTSP: TCP transport + 10 second timeout (once)
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;10000000"
+
+    # Create detector once (reused across reconnections)
+    detector = create_detector(detector_type, cascade_path=cascade_path)
 
     # Reconnection loop
     attempts = 0
@@ -626,12 +633,12 @@ def recognize_from_rtsp(rtsp_url: str,
                 # Convert BGR to RGB for face_recognition
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Fast detection every frame (uses cached classifier)
-                current_boxes = tracker.detect_faces(frame_rgb, cascade_path, DEFAULT_DETECTOR_PARAMS)
+                # Fast detection every frame
+                current_boxes = tracker.detect_faces(frame_rgb, detector)
 
                 if tracker.should_reidentify(current_boxes):
                     # Full recognition (expensive) - only when needed
-                    detections = process_frame(frame_rgb, known_encodings, labels, cascade_path, threshold)
+                    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
                     # Update tracker cache
                     tracker.update(
                         boxes=[d.bbox for d in detections],
@@ -749,6 +756,12 @@ Examples:
     parser.add_argument("--max-retries", type=int, default=5,
                        help="Maximum RTSP reconnection attempts before giving up (default: 5)")
 
+    parser.add_argument("--detector", choices=["haar", "retinaface"], default="haar",
+                       help="Face detection backend (default: haar)")
+
+    parser.add_argument("--align", action="store_true",
+                       help="Enable landmark-based face alignment (requires retinaface detector)")
+
     return parser.parse_args()
 
 
@@ -770,7 +783,9 @@ def main():
                     resize_width=args.resize_width,
                     fps_display=not args.no_display,
                     max_retries=args.max_retries,
-                    tracker_interval=args.tracker_interval
+                    tracker_interval=args.tracker_interval,
+                    detector_type=args.detector,
+                    do_align=args.align
                 )
             else:
                 # Webcam mode
@@ -787,7 +802,9 @@ def main():
                     cascade_path=args.cascade,
                     resize_width=args.resize_width,
                     fps_display=not args.no_display,
-                    tracker_interval=args.tracker_interval
+                    tracker_interval=args.tracker_interval,
+                    detector_type=args.detector,
+                    do_align=args.align
                 )
 
         elif args.mode == "image":
@@ -802,7 +819,9 @@ def main():
                 threshold=args.threshold,
                 cascade_path=args.cascade,
                 output_path=args.output,
-                display=not args.no_display
+                display=not args.no_display,
+                detector_type=args.detector,
+                do_align=args.align
             )
 
         elif args.mode == "video":
@@ -820,7 +839,9 @@ def main():
                 frame_skip=args.frame_skip,
                 resize_width=args.resize_width,
                 display=args.display,
-                tracker_interval=args.tracker_interval
+                tracker_interval=args.tracker_interval,
+                detector_type=args.detector,
+                do_align=args.align
             )
 
     except KeyboardInterrupt:
