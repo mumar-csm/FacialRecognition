@@ -13,7 +13,7 @@ from typing import List, Tuple, Dict, Any, Optional
 
 import cv2
 import numpy as np
-import face_recognition
+from embedding_factory import create_embedder
 
 # Import distance calculation functions
 from euclideanDist import euclidean_distance
@@ -29,12 +29,13 @@ from visualization import draw_annotations
 from detector_factory import create_detector, align_face, FaceDetector
 
 
-def load_database(db_path: str) -> Tuple[List[List[float]], List[str]]:
+def load_database(db_path: str, expected_embedder: str = "dlib") -> Tuple[List[List[float]], List[str]]:
     """
     Load face database from pickle file
 
     Args:
         db_path: Path to known_faces.pkl
+        expected_embedder: The embedder the caller intends to use (for mismatch warning)
 
     Returns:
         Tuple of (encodings_list, labels_list)
@@ -56,7 +57,21 @@ def load_database(db_path: str) -> Tuple[List[List[float]], List[str]]:
         if len(db.encodings) == 0:
             raise ValueError("Database is empty")
 
-        print(f"[INFO] Loaded database: {len(db.encodings)} employees")
+        # Backward compatibility: old v1 databases lack these fields
+        if not hasattr(db, 'embedder_type'):
+            db.embedder_type = "dlib"
+        if not hasattr(db, 'embedding_dim'):
+            db.embedding_dim = 128
+
+        # Mismatch warning
+        if db.embedder_type != expected_embedder:
+            print(f"[WARNING] Database was built with '{db.embedder_type}' embedder "
+                  f"but current CLI uses '{expected_embedder}'.")
+            print(f"[WARNING] Distances will be unreliable. Rebuild with: "
+                  f"--embedder {expected_embedder}")
+
+        print(f"[INFO] Loaded database: {len(db.encodings)} employees "
+              f"({db.embedding_dim}-D, embedder={db.embedder_type})")
         print(f"[INFO] Employees: {', '.join(db.labels)}")
 
         return db.encodings, db.labels
@@ -110,7 +125,8 @@ def find_best_match(unknown_encoding: np.ndarray,
 
 def detect_and_encode_faces(frame: np.ndarray,
                             detector: FaceDetector,
-                            do_align: bool = False) -> List[Tuple[Tuple[int, int, int, int], np.ndarray]]:
+                            do_align: bool = False,
+                            embedder=None) -> List[Tuple[Tuple[int, int, int, int], np.ndarray]]:
     """
     Detect faces in frame and compute embeddings
 
@@ -118,38 +134,38 @@ def detect_and_encode_faces(frame: np.ndarray,
         frame: RGB image (numpy array)
         detector: A FaceDetector instance (HaarDetector, RetinaFaceDetector, etc.)
         do_align: If True and landmarks are available, align face before encoding
+        embedder: A FaceEmbedder instance (DlibEmbedder, ArcFaceEmbedder, etc.)
 
     Returns:
         List of (bbox, encoding) tuples
         bbox: (x, y, w, h)
-        encoding: 128-d numpy array
+        encoding: numpy array (128-d or 512-d depending on embedder)
     """
     detections = detector.detect(frame)
     results = []
 
     for (x, y, w, h), landmarks in detections:
         try:
+            vec = None
             if do_align and landmarks is not None:
-                # Align face using landmarks, then encode the aligned crop
                 aligned = align_face(frame, landmarks)
                 aligned = np.ascontiguousarray(aligned)
-                encodings = face_recognition.face_encodings(aligned)
+                vec = embedder.embed(aligned)
             else:
-                # Standard path: pass bbox to face_recognition
-                # Convert (x,y,w,h) to face_recognition format (top, right, bottom, left)
-                fr_box = (y, x + w, y + h, x)
-                encodings = face_recognition.face_encodings(frame, known_face_locations=[fr_box])
-
-            if encodings:
-                results.append(((x, y, w, h), encodings[0]))
-            else:
-                # Fallback: crop ROI and encode
                 face_roi = frame[y:y+h, x:x+w]
                 if face_roi.size > 0:
                     face_roi = np.ascontiguousarray(face_roi)
-                    encodings = face_recognition.face_encodings(face_roi)
-                    if encodings:
-                        results.append(((x, y, w, h), encodings[0]))
+                    vec = embedder.embed(face_roi)
+
+            # Fallback: crop ROI and encode
+            if vec is None:
+                face_roi = frame[y:y+h, x:x+w]
+                if face_roi.size > 0:
+                    face_roi = np.ascontiguousarray(face_roi)
+                    vec = embedder.embed(face_roi)
+
+            if vec is not None:
+                results.append(((x, y, w, h), vec))
 
         except Exception as e:
             print(f"[WARN] Encoding failed for face at ({x},{y}): {e}")
@@ -164,7 +180,8 @@ def process_frame(frame: np.ndarray,
                  labels: List[str],
                  detector: FaceDetector,
                  threshold: float = 1.0,
-                 do_align: bool = False) -> List[Detection]:
+                 do_align: bool = False,
+                 embedder=None) -> List[Detection]:
     """
     Process a single frame: detect faces, encode, and match
 
@@ -175,12 +192,13 @@ def process_frame(frame: np.ndarray,
         detector: A FaceDetector instance
         threshold: Matching threshold
         do_align: If True, align faces using landmarks before encoding
+        embedder: A FaceEmbedder instance
 
     Returns:
         List of Detection objects
     """
     # Detect and encode faces
-    face_data = detect_and_encode_faces(frame, detector, do_align)
+    face_data = detect_and_encode_faces(frame, detector, do_align, embedder)
 
     # Match each face
     detections = []
@@ -201,7 +219,10 @@ def recognize_from_webcam(db_path: str,
                          fps_display: bool = True,
                          tracker_interval: int = 30,
                          detector_type: str = "haar",
-                         do_align: bool = False) -> None:
+                         do_align: bool = False,
+                         embedder_type: str = "dlib",
+                         model_name: str = "buffalo_l",
+                         ctx_id: int = -1) -> None:
     """
     Real-time face recognition from webcam
 
@@ -215,10 +236,16 @@ def recognize_from_webcam(db_path: str,
         tracker_interval: Frames between re-identification (default: 30)
         detector_type: Detection backend ("haar" or "retinaface")
         do_align: Enable landmark-based face alignment
+        embedder_type: Embedding backend ("dlib" or "arcface")
+        model_name: InsightFace model pack name (default: buffalo_l)
+        ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
     """
     # Load database
     print("[INFO] Loading face database...")
-    known_encodings, labels = load_database(db_path)
+    known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
+
+    # Create embedder
+    embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
 
     # Open webcam
     print(f"[INFO] Opening camera {camera_index}...")
@@ -250,7 +277,7 @@ def recognize_from_webcam(db_path: str,
                 scale = resize_width / frame.shape[1]
                 frame = cv2.resize(frame, (resize_width, int(frame.shape[0] * scale)))
 
-            # Convert BGR to RGB for face_recognition
+            # Convert BGR to RGB for face embedding
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Fast detection every frame
@@ -258,7 +285,7 @@ def recognize_from_webcam(db_path: str,
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
-                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
+                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
                 # Update tracker cache
                 tracker.update(
                     boxes=[d.bbox for d in detections],
@@ -303,7 +330,10 @@ def recognize_from_image(image_path: str,
                         output_path: Optional[str] = None,
                         display: bool = True,
                         detector_type: str = "haar",
-                        do_align: bool = False) -> List[Detection]:
+                        do_align: bool = False,
+                        embedder_type: str = "dlib",
+                        model_name: str = "buffalo_l",
+                        ctx_id: int = -1) -> List[Detection]:
     """
     Face recognition on a single image
 
@@ -316,13 +346,19 @@ def recognize_from_image(image_path: str,
         display: Display result window
         detector_type: Detection backend ("haar" or "retinaface")
         do_align: Enable landmark-based face alignment
+        embedder_type: Embedding backend ("dlib" or "arcface")
+        model_name: InsightFace model pack name (default: buffalo_l)
+        ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
 
     Returns:
         List of Detection objects
     """
     # Load database
     print("[INFO] Loading face database...")
-    known_encodings, labels = load_database(db_path)
+    known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
+
+    # Create embedder
+    embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
 
     # Load image
     print(f"[INFO] Loading image: {image_path}")
@@ -339,7 +375,7 @@ def recognize_from_image(image_path: str,
     # Process frame
     print("[INFO] Processing image...")
     detector = create_detector(detector_type, cascade_path=cascade_path)
-    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
+    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
 
     print(f"[INFO] Detected {len(detections)} face(s)")
     for det in detections:
@@ -372,7 +408,10 @@ def recognize_from_video(video_path: str,
                         display: bool = False,
                         tracker_interval: int = 30,
                         detector_type: str = "haar",
-                        do_align: bool = False) -> Dict[str, Any]:
+                        do_align: bool = False,
+                        embedder_type: str = "dlib",
+                        model_name: str = "buffalo_l",
+                        ctx_id: int = -1) -> Dict[str, Any]:
     """
     Face recognition on video file
 
@@ -388,6 +427,9 @@ def recognize_from_video(video_path: str,
         tracker_interval: Frames between re-identification (default: 30)
         detector_type: Detection backend ("haar" or "retinaface")
         do_align: Enable landmark-based face alignment
+        embedder_type: Embedding backend ("dlib" or "arcface")
+        model_name: InsightFace model pack name (default: buffalo_l)
+        ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
 
     Returns:
         Dictionary with statistics:
@@ -398,7 +440,10 @@ def recognize_from_video(video_path: str,
     """
     # Load database
     print("[INFO] Loading face database...")
-    known_encodings, labels = load_database(db_path)
+    known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
+
+    # Create embedder
+    embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
 
     # Warn if no output and no display
     if not output_path and not display:
@@ -474,7 +519,7 @@ def recognize_from_video(video_path: str,
                 scale = resize_width / frame.shape[1]
                 frame = cv2.resize(frame, (resize_width, int(frame.shape[0] * scale)))
 
-            # Convert BGR to RGB for face_recognition
+            # Convert BGR to RGB for face embedding
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
             # Fast detection every frame
@@ -482,7 +527,7 @@ def recognize_from_video(video_path: str,
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
-                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
+                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
                 # Update tracker cache
                 tracker.update(
                     boxes=[d.bbox for d in detections],
@@ -556,7 +601,10 @@ def recognize_from_rtsp(rtsp_url: str,
                         max_retries: int = 5,
                         tracker_interval: int = 30,
                         detector_type: str = "haar",
-                        do_align: bool = False) -> None:
+                        do_align: bool = False,
+                        embedder_type: str = "dlib",
+                        model_name: str = "buffalo_l",
+                        ctx_id: int = -1) -> None:
     """
     Real-time face recognition from RTSP stream
 
@@ -571,10 +619,16 @@ def recognize_from_rtsp(rtsp_url: str,
         tracker_interval: Frames between re-identification (default: 30)
         detector_type: Detection backend ("haar" or "retinaface")
         do_align: Enable landmark-based face alignment
+        embedder_type: Embedding backend ("dlib" or "arcface")
+        model_name: InsightFace model pack name (default: buffalo_l)
+        ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
     """
     # Load face database (once, outside retry loop)
     print("[INFO] Loading face database...")
-    known_encodings, labels = load_database(db_path)
+    known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
+
+    # Create embedder
+    embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
 
     # Configure FFMPEG for RTSP: TCP transport + 10 second timeout (once)
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;10000000"
@@ -630,7 +684,7 @@ def recognize_from_rtsp(rtsp_url: str,
                     scale = resize_width / frame.shape[1]
                     frame = cv2.resize(frame, (resize_width, int(frame.shape[0] * scale)))
 
-                # Convert BGR to RGB for face_recognition
+                # Convert BGR to RGB for face embedding
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
                 # Fast detection every frame
@@ -638,7 +692,7 @@ def recognize_from_rtsp(rtsp_url: str,
 
                 if tracker.should_reidentify(current_boxes):
                     # Full recognition (expensive) - only when needed
-                    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align)
+                    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
                     # Update tracker cache
                     tracker.update(
                         boxes=[d.bbox for d in detections],
@@ -762,6 +816,15 @@ Examples:
     parser.add_argument("--align", action="store_true",
                        help="Enable landmark-based face alignment (requires retinaface detector)")
 
+    parser.add_argument("--embedder", choices=["dlib", "arcface"], default="dlib",
+                       help="Embedding backend (default: dlib)")
+
+    parser.add_argument("--model", default="buffalo_l",
+                       help="InsightFace model pack name (default: buffalo_l)")
+
+    parser.add_argument("--gpu", type=int, default=-1,
+                       help="GPU device ID (-1 for CPU, 0+ for GPU)")
+
     return parser.parse_args()
 
 
@@ -785,7 +848,10 @@ def main():
                     max_retries=args.max_retries,
                     tracker_interval=args.tracker_interval,
                     detector_type=args.detector,
-                    do_align=args.align
+                    do_align=args.align,
+                    embedder_type=args.embedder,
+                    model_name=args.model,
+                    ctx_id=args.gpu
                 )
             else:
                 # Webcam mode
@@ -804,7 +870,10 @@ def main():
                     fps_display=not args.no_display,
                     tracker_interval=args.tracker_interval,
                     detector_type=args.detector,
-                    do_align=args.align
+                    do_align=args.align,
+                    embedder_type=args.embedder,
+                    model_name=args.model,
+                    ctx_id=args.gpu
                 )
 
         elif args.mode == "image":
@@ -821,7 +890,10 @@ def main():
                 output_path=args.output,
                 display=not args.no_display,
                 detector_type=args.detector,
-                do_align=args.align
+                do_align=args.align,
+                embedder_type=args.embedder,
+                model_name=args.model,
+                ctx_id=args.gpu
             )
 
         elif args.mode == "video":
@@ -841,7 +913,10 @@ def main():
                 display=args.display,
                 tracker_interval=args.tracker_interval,
                 detector_type=args.detector,
-                do_align=args.align
+                do_align=args.align,
+                embedder_type=args.embedder,
+                model_name=args.model,
+                ctx_id=args.gpu
             )
 
     except KeyboardInterrupt:

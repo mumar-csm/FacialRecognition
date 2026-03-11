@@ -14,7 +14,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import os
 import cv2
 import numpy as np
-import face_recognition
+from embedding_factory import create_embedder
 import pickle
 import hashlib
 from datetime import datetime
@@ -33,7 +33,7 @@ class ImageRecord:
 class FaceRecord:
     """Represents a single encoded face and minimal metadata."""
     label: str # employee_id
-    encoding: List[float] # 128-d face encoding from face_recognition/dlib
+    encoding: List[float] # face embedding (128-d dlib or 512-d arcface)
     image_path: str
     box: Tuple[int, int, int, int] # (top, right, bottom, left)/(x,y,width,height)
 
@@ -47,6 +47,8 @@ class EncodingsDB:
     labels: List[str]
     meta: List[Dict[str, Any]] # per-record metadata (image_path, box, etc.)
     version: str = "schema_v1"
+    embedding_dim: int = 128        # 128 for dlib, 512 for arcface
+    embedder_type: str = "dlib"     # "dlib" or "arcface"
 
 
 # Config
@@ -71,7 +73,7 @@ def load_config() -> Dict[str, Any]:
             "margin_pct": 0.20 # simple margin around detected face
         },
         "defaults": {
-            "schema_version": "schema_v1"
+            "schema_version": "schema_v2"
         }
     }
     return config
@@ -238,7 +240,7 @@ def crop_with_margin(img: Any, box: Tuple[int, int, int, int],margin_pct: float 
 
 # Embedding computation
 
-def compute_embedding(face_roi: np.ndarray) -> Optional[List[float]]:
+def compute_embedding(face_roi: np.ndarray, embedder=None) -> Optional[List[float]]:
     # 1) Normalize channels (handle grayscale / RGBA)
     if face_roi is None:
         print("[ERROR] ROI is None")
@@ -267,14 +269,16 @@ def compute_embedding(face_roi: np.ndarray) -> Optional[List[float]]:
     elif face_roi.dtype != np.uint8:
         face_roi = face_roi.astype(np.uint8)
 
-    # 3) Ensure C-contiguous for dlib
+    # 3) Ensure C-contiguous
     face_roi = np.ascontiguousarray(face_roi)
 
     # 4) Encode
-    encodings = face_recognition.face_encodings(face_roi)
-    if not encodings:
+    if embedder is None:
+        embedder = create_embedder("dlib")
+    vec = embedder.embed(face_roi)
+    if vec is None:
         return None
-    return encodings[0].tolist()
+    return vec.tolist()
 
 # Record building and serialization
 
@@ -289,19 +293,25 @@ def build_record(employee_id: str, image_path: str, encoding: List[float], box: 
         box=box
     )
 
-def serialize(records: List[FaceRecord], output_pkl_path: str, schema_version: str = "schema_v1") -> None:
+def serialize(records: List[FaceRecord], output_pkl_path: str,
+              schema_version: str = "schema_v2",
+              embedding_dim: int = 128, embedder_type: str = "dlib") -> None:
     """
     Persist EncodingsDB to output_pkl_path.
-    DB layout (MVP):
-       - encodings: List[List[float]] (List of 128-d float lists)
+    DB layout:
+       - encodings: List[List[float]] (embedding vectors)
        - labels: List[str] (employee IDs)
-       - meta: List[Dict[str, Any]] (image_path, box, etc.) with minimal fields
+       - meta: List[Dict[str, Any]] (image_path, box, etc.)
        - version: schema_version
+       - embedding_dim: dimensionality (128 or 512)
+       - embedder_type: "dlib" or "arcface"
     """
     encs = [r.encoding for r in records]
     labels = [r.label for r in records]
     meta = [{"image_path": r.image_path, "box": r.box} for r in records]
-    db = EncodingsDB(encodings=encs, labels=labels, meta=meta, version=schema_version)
+    db = EncodingsDB(encodings=encs, labels=labels, meta=meta,
+                     version=schema_version,
+                     embedding_dim=embedding_dim, embedder_type=embedder_type)
 
     out_dir = os.path.dirname(output_pkl_path) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -358,6 +368,14 @@ def parse_args() -> argparse.Namespace:
                        help="Face detection backend (default: haar)")
     parser.add_argument("--align", action="store_true",
                        help="Enable landmark-based face alignment (requires retinaface detector)")
+    parser.add_argument("--embedder", choices=["dlib", "arcface"], default="dlib",
+                       help="Embedding backend (default: dlib)")
+
+    parser.add_argument("--model", default="buffalo_l",
+                       help="InsightFace model pack name (default: buffalo_l)")
+
+    parser.add_argument("--gpu", type=int, default=-1,
+                       help="GPU device ID (-1 for CPU, 0+ for GPU)")
     return parser.parse_args()
 
 
@@ -378,6 +396,22 @@ def _get_worker_detector(config):
     return _worker_detector
 
 
+# Module-level embedder cache for multiprocessing workers.
+_worker_embedder = None
+
+
+def _get_worker_embedder(config):
+    """Lazily create/cache an embedder in the current worker process."""
+    global _worker_embedder
+    if _worker_embedder is None:
+        _worker_embedder = create_embedder(
+            config["embedder_type"],
+            model_name=config.get("model_name", "buffalo_l"),
+            ctx_id=config.get("ctx_id", -1)
+        )
+    return _worker_embedder
+
+
 def encode_single_image(args_tuple):
     """
     Worker function for multiprocessing. Processes one image end-to-end.
@@ -393,6 +427,7 @@ def encode_single_image(args_tuple):
     do_align = config.get("do_align", False)
 
     detector = _get_worker_detector(config)
+    embedder = _get_worker_embedder(config)
 
     # 1. Validate and load
     img = validate_and_load(image_record.image_path)
@@ -418,39 +453,31 @@ def encode_single_image(args_tuple):
         img_prep = img_prep.astype(np.uint8)
         img_prep = np.ascontiguousarray(img_prep)
 
-    # 4. Encode: aligned path or standard path
+    # 4. Encode: aligned path or standard (crop) path
+    vec = None
     if do_align and landmarks is not None:
         aligned = align_face(img_prep, landmarks)
         aligned = np.ascontiguousarray(aligned)
-        try:
-            encs = face_recognition.face_encodings(aligned)
-        except Exception:
-            encs = []
+        vec = embedder.embed(aligned)
     else:
-        # Standard path: pass bbox to face_recognition
-        fr_box = (y, x + w, y + h, x)
-        try:
-            encs = face_recognition.face_encodings(img_prep, known_face_locations=[fr_box])
-        except Exception:
-            encs = []
+        face_roi = img_prep[y:y+h, x:x+w]
+        if face_roi is not None and face_roi.size > 0:
+            face_roi = np.ascontiguousarray(face_roi.astype(np.uint8))
+            vec = embedder.embed(face_roi)
 
-    # 5. Fallback: manual crop
-    if not encs:
+    # 5. Fallback: manual crop (if aligned path failed)
+    if vec is None:
         face_roi = img_prep[y:y+h, x:x+w]
         if face_roi is None or face_roi.size == 0:
             return "encoding_fail"
-
         face_roi = np.ascontiguousarray(face_roi.astype(np.uint8))
-        try:
-            encs = face_recognition.face_encodings(face_roi)
-        except Exception:
-            encs = []
+        vec = embedder.embed(face_roi)
 
     # 6. Final check
-    if not encs:
+    if vec is None:
         return "encoding_fail"
 
-    encoding = encs[0].tolist()
+    encoding = vec.tolist()
     return build_record(image_record.employee_id, image_record.image_path, encoding, (x, y, w, h))
 
 
@@ -517,6 +544,9 @@ def cli_main() -> None:
         "detector_type": args.detector,
         "detector_params": config["detector"],
         "do_align": args.align,
+        "embedder_type": args.embedder,
+        "model_name": args.model,
+        "ctx_id": args.gpu,
     }
     work_items = [(rec, worker_config) for rec in images]
 
@@ -557,9 +587,12 @@ def cli_main() -> None:
             FaceRecord(label=label, encoding=enc, image_path=m["image_path"], box=tuple(m["box"]))
             for enc, label, m in zip(merged_db.encodings, merged_db.labels, merged_db.meta)
         ]
-        serialize(merged_records, output_pkl, schema_version=merged_db.version)
+        serialize(merged_records, output_pkl, schema_version=merged_db.version,
+                  embedding_dim=merged_db.embedding_dim, embedder_type=merged_db.embedder_type)
     else:
-        serialize(new_records, output_pkl, schema_version=config["defaults"]["schema_version"])
+        embedder_dim = 128 if args.embedder == "dlib" else 512
+        serialize(new_records, output_pkl, schema_version=config["defaults"]["schema_version"],
+                  embedding_dim=embedder_dim, embedder_type=args.embedder)
 
     # Summary
     print(f"[SUMMARY] Total images: {len(images)}")

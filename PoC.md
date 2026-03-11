@@ -384,63 +384,61 @@ Examples:
 ### 3.2 Embedding Factory with ArcFace (1 week)
 
 #### Tasks:
-- [ ] **Create embedding_factory.py** (new file)
-  - [ ] Add imports: typing, Protocol, Optional, numpy, insightface
-  - [ ] Define `FaceEmbedder` Protocol class
-    - [ ] Method: `embed(face_image) -> Optional[np.ndarray]`
-    - [ ] Property: `embedding_dim() -> int`
-  - [ ] Implement `DlibEmbedder` class
-    - [ ] Init: import face_recognition library
-    - [ ] embed(): call face_recognition.face_encodings()
-    - [ ] embedding_dim: return 128
-  - [ ] Implement `ArcFaceEmbedder` class
-    - [ ] Init: load InsightFace ArcFace model
-    - [ ] Use: `get_model(model_name, providers=[...])`
-    - [ ] Model options: "arcface_r50_v1", "arcface_mnet_v1"
-    - [ ] Call: `model.prepare(ctx_id)` (-1 for CPU, 0+ for GPU)
-    - [ ] embed(): resize face to 112x112, call model.get_feat()
-    - [ ] embedding_dim: return 512
-  - [ ] Implement `create_embedder(embedder_type, **kwargs)` factory
-    - [ ] Support: "dlib", "arcface"
-    - [ ] Return appropriate embedder instance
+- [x] **Create embedding_factory.py** (new file)
+  - [x] Add imports: typing, Protocol, Optional, numpy, insightface
+  - [x] Define `FaceEmbedder` Protocol class
+    - [x] Method: `embed(face_image) -> Optional[np.ndarray]`
+    - [x] Property: `embedding_dim() -> int`
+  - [x] Implement `DlibEmbedder` class
+    - [x] Init: import face_recognition library
+    - [x] embed(): call face_recognition.face_encodings()
+    - [x] embedding_dim: return 128
+  - [x] Implement `ArcFaceEmbedder` class
+    - [x] Init: load InsightFace ArcFace model directly via `model_zoo.get_model()` (not FaceAnalysis)
+    - [x] Loads only `w600k_r50.onnx` rec model — no wasted detection/landmark/genderage models
+    - [x] Call: `model.prepare(ctx_id)` (-1 for CPU, 0+ for GPU)
+    - [x] embed(): resize face to 112x112, call model.get_feat()
+    - [x] embedding_dim: return 512
+  - [x] Implement `create_embedder(embedder_type, **kwargs)` factory
+    - [x] Support: "dlib", "arcface"
+    - [x] Return appropriate embedder instance
 
-- [ ] **Update EncodingsDB schema** in [build_encodings.py](build_encodings.py) (lines 39-48)
-  - [ ] Add field: `version: str = "schema_v2"`
-  - [ ] Add field: `embedding_dim: int = 128`
-  - [ ] Add field: `embedder_type: str = "dlib"`
-  - [ ] Keep backward compatibility with v1 databases
+- [x] **Update EncodingsDB schema** in [build_encodings.py](build_encodings.py)
+  - [x] Add field: `embedding_dim: int = 128`
+  - [x] Add field: `embedder_type: str = "dlib"`
+  - [x] Keep backward compatibility with v1 databases
 
-- [ ] **Update database loader** in [recognize.py](recognize.py) (lines 234-267)
-  - [ ] Modify `load_database()` function
-  - [ ] Check for embedder_type field (use getattr with default)
-  - [ ] Check for embedding_dim field (use getattr with default)
-  - [ ] Print info: "Database: {embedder_type} ({embedding_dim}-D embeddings)"
-  - [ ] Return: (encodings, labels, embedder_type, embedding_dim)
+- [x] **Update database loader** in [recognize.py](recognize.py)
+  - [x] Modify `load_database()` function
+  - [x] Check for embedder_type field (use hasattr with default)
+  - [x] Check for embedding_dim field (use hasattr with default)
+  - [x] Print info: "Database: {embedder_type} ({embedding_dim}-D embeddings)"
+  - [x] Warn if CLI embedder != database embedder
 
-- [ ] **Update recognize.py to use embedding factory**
-  - [ ] Import: `from embedding_factory import create_embedder`
-  - [ ] Add `--embedder` argument in parse_args()
-    - [ ] choices=["dlib", "arcface"], default="dlib"
-  - [ ] Add `--model` argument in parse_args()
-    - [ ] default="arcface_r50_v1"
-    - [ ] help="ArcFace model (arcface_r50_v1 or arcface_mnet_v1)"
-  - [ ] Add `--gpu` argument in parse_args()
-    - [ ] type=int, default=-1
-    - [ ] help="GPU device ID (-1 for CPU)"
-  - [ ] In main(): load database and check embedder compatibility
-    - [ ] Load: `encodings, labels, db_embedder, db_dim = load_database(...)`
-    - [ ] Warn if args.embedder != db_embedder
-    - [ ] Create embedder: `embedder = create_embedder(args.embedder, ...)`
-  - [ ] Modify detect_and_encode_faces() to accept embedder
-    - [ ] Call embedder.embed(face_roi) instead of face_recognition
-    - [ ] Handle None return value
+- [x] **Update recognize.py to use embedding factory**
+  - [x] Import: `from embedding_factory import create_embedder`
+  - [x] Add `--embedder` argument in parse_args()
+    - [x] choices=["dlib", "arcface"], default="dlib"
+  - [x] Add `--model` argument in parse_args()
+    - [x] default="buffalo_l"
+    - [x] help="InsightFace model pack name"
+  - [x] Add `--gpu` argument in parse_args()
+    - [x] type=int, default=-1
+    - [x] help="GPU device ID (-1 for CPU)"
+  - [x] In main(): load database and check embedder compatibility
+    - [x] Warn if args.embedder != db_embedder
+    - [x] Create embedder: `embedder = create_embedder(args.embedder, ...)`
+  - [x] Modify detect_and_encode_faces() to accept embedder
+    - [x] Call embedder.embed(face_roi) instead of face_recognition
+    - [x] Handle None return value
 
-- [ ] **Update build_encodings.py to use embedding factory**
-  - [ ] Import: `from embedding_factory import create_embedder`
-  - [ ] Add `--embedder`, `--model`, `--gpu` arguments
-  - [ ] Create embedder instance in cli_main()
-  - [ ] Pass embedder to encoding functions
-  - [ ] Update serialize() to save embedder_type and embedding_dim
+- [x] **Update build_encodings.py to use embedding factory**
+  - [x] Import: `from embedding_factory import create_embedder`
+  - [x] Add `--embedder` argument
+  - [x] Add `--model`, `--gpu` arguments
+  - [x] Create embedder instance in cli_main() (per-worker cache via _get_worker_embedder)
+  - [x] Pass embedder to encoding functions
+  - [x] Update serialize() to save embedder_type and embedding_dim
 
 #### Testing Checklist:
 - [ ] Test dlib embedder (backward compatibility)
