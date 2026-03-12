@@ -1,11 +1,11 @@
 # Facial Recognition System
 
-An employee facial recognition application using Python, OpenCV, and dlib. The system detects faces in images or video streams, computes facial embeddings, and matches them against a pre-built database for identification.
+An employee facial recognition application using Python, OpenCV, and pluggable detection/embedding backends. The system detects faces in images or video streams, computes facial embeddings, and matches them against a pre-built database for identification.
 
 ## Features
 
-- **Face Detection** - Uses Haar Cascade classifiers for robust face detection
-- **128-D Embeddings** - Computes facial embeddings using dlib's ResNet model
+- **Face Detection** - Pluggable: Haar Cascade (fast, ~5ms) or RetinaFace (accurate, neural network)
+- **Face Embedding** - Pluggable: dlib 128-D (legacy) or ArcFace 512-D (modern, better accuracy)
 - **Real-Time Recognition** - Live webcam recognition with bounding boxes and confidence scores
 - **Image Recognition** - Analyze static images and save annotated results
 - **Flexible Input** - Supports JPG, PNG, RGB, RGBA, and grayscale images
@@ -90,13 +90,18 @@ pip install -r requirements.txt
 ```
 FacialRecognition/
 ├── build_encodings.py      # Build face embeddings database
-├── recognize.py            # Runtime recognition (webcam/image)
+├── recognize.py            # Runtime recognition (webcam/image/video/RTSP)
+├── detector_factory.py     # Detection backends (Haar, RetinaFace)
+├── embedding_factory.py    # Embedding backends (dlib, ArcFace)
+├── tracker.py              # SimpleTracker for real-time optimization
+├── visualization.py        # Bounding box / label drawing
+├── tune_threshold.py       # Threshold analysis tool
+├── euclideanDist.py        # Distance calculation utilities
 ├── detect_faces.py         # Face detection utility
 ├── inspect_pkl.py          # Database inspection tool
-├── euclideanDist.py        # Distance calculation utilities
 ├── requirements.txt        # Python dependencies
 ├── data/
-│   ├── haarcascade_frontalface_default.xml   # Face detector model
+│   ├── haarcascade_frontalface_default.xml   # Haar detector model
 │   ├── known_faces.pkl                       # Face database (generated)
 │   └── logs/
 │       └── recognition.csv                   # Recognition event log
@@ -126,16 +131,27 @@ employees/
 
 ### Step 2: Build the Face Database
 
+**Haar + dlib (legacy)**
 ```bash
-python build_encodings.py --root ./employees --cascade data/haarcascade_frontalface_default.xml
+python build_encodings.py --root ./employees
+```
+
+**RetinaFace + ArcFace (recommended)**
+```bash
+python build_encodings.py --embedder arcface --detector retinaface --align --root ./employees --output data/known_faces_arcface.pkl
 ```
 
 **Options:**
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--root` | Directory containing employee photos | (required) |
-| `--cascade` | Path to Haar Cascade XML | (required) |
+| `--cascade` | Path to Haar Cascade XML | `data/haarcascade_frontalface_default.xml` |
 | `--output` | Output database path | `data/known_faces.pkl` |
+| `--detector` | Detection backend: `haar`, `retinaface` | `haar` |
+| `--embedder` | Embedding backend: `dlib`, `arcface` | `dlib` |
+| `--align` | Enable face alignment (requires landmarks) | `False` |
+| `--model` | InsightFace model pack name | `buffalo_l` |
+| `--gpu` | GPU device ID (-1 for CPU) | `-1` |
 | `--margin` | Crop margin around face | `0.20` |
 | `--max-long-edge` | Resize cap for large images | `1600` |
 | `--rebuild` | Ignore existing DB and rebuild | `False` |
@@ -145,12 +161,21 @@ python build_encodings.py --root ./employees --cascade data/haarcascade_frontalf
 
 **Webcam Mode (Real-Time)**
 ```bash
-python recognize.py --mode webcam --source 0
+# Haar + dlib (fast, ~48 FPS on CPU)
+python recognize.py --mode webcam --source 0 --threshold 0.58
+
+# RetinaFace + ArcFace (accurate, ~4.5 FPS on CPU, GPU-ready)
+python recognize.py --embedder arcface --detector retinaface --align --mode webcam --source 0 --database data/known_faces_arcface.pkl --threshold 1.0
 ```
 
 **Image Mode**
 ```bash
-python recognize.py --mode image --source photo.jpg --output result.jpg
+python recognize.py --embedder arcface --detector retinaface --align --mode image --source photo.jpg --database data/known_faces_arcface.pkl --threshold 1.0 --output result.jpg
+```
+
+**Video Mode**
+```bash
+python recognize.py --embedder arcface --detector retinaface --align --mode video --source video.mp4 --database data/known_faces_arcface.pkl --threshold 1.0 --output result.mp4
 ```
 
 **Options:**
@@ -159,10 +184,17 @@ python recognize.py --mode image --source photo.jpg --output result.jpg
 | `--mode` | Recognition mode: `webcam`, `image`, `video` | `webcam` |
 | `--source` | Camera index or file path | `0` |
 | `--database` | Path to face database | `data/known_faces.pkl` |
+| `--detector` | Detection backend: `haar`, `retinaface` | `haar` |
+| `--embedder` | Embedding backend: `dlib`, `arcface` | `dlib` |
+| `--align` | Enable face alignment | `False` |
+| `--model` | InsightFace model pack name | `buffalo_l` |
+| `--gpu` | GPU device ID (-1 for CPU) | `-1` |
 | `--threshold` | Match threshold (lower = stricter) | `1.0` |
-| `--output` | Save annotated result (image mode) | None |
+| `--output` | Save annotated result | None |
 | `--resize-width` | Frame width for performance | `640` |
 | `--no-display` | Disable visualization | `False` |
+
+> **Note**: The `--embedder` must match the database. Using an ArcFace database with the dlib embedder (or vice versa) will produce an error — rebuild the database with the matching embedder.
 
 **Controls:**
 - Press `q` to quit webcam mode
@@ -283,10 +315,15 @@ This compares all pairwise distances between encodings and outputs:
 - **Genuine distances** (same person, different photos) — requires multiple photos per person
 - **Recommended thresholds** — strict, balanced (EER), and lenient options
 
-**Current findings** (10 employees, 1 photo each — impostor-only analysis):
-- Impostor distance range: 0.585 – 1.004
-- Recommended maximum threshold: **0.58** (any higher risks false matches)
-- Re-run after adding multiple photos per person for full EER-based recommendations
+**Current findings** (11 employees, 1 photo each — impostor-only analysis):
+
+| Embedder | Impostor Range | Recommended Threshold |
+|----------|---------------|----------------------|
+| dlib (128-D) | 0.56 – 1.01 | ≤ **0.56** |
+| ArcFace (512-D) | 1.18 – 1.52 | ≤ **1.18** |
+
+ArcFace provides 2x better impostor separation with tighter variance (std 0.06 vs 0.09).
+Re-run after adding multiple photos per person for full EER-based recommendations.
 
 The tool saves a `threshold_analysis.png` plot for visual inspection.
 

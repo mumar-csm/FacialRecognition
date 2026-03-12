@@ -173,6 +173,11 @@ class ArcFaceEmbedder:
             # get_feat returns shape (1, 512) — flatten to 1-D
             if embedding is not None:
                 embedding = embedding.flatten().astype(np.float64)
+                # L2-normalize so Euclidean distances are bounded [0, 2]
+                # and comparable to dlib's normalized output.
+                norm = np.linalg.norm(embedding)
+                if norm > 0:
+                    embedding = embedding / norm
                 return embedding
 
         except Exception:

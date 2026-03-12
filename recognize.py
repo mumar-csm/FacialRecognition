@@ -63,12 +63,13 @@ def load_database(db_path: str, expected_embedder: str = "dlib") -> Tuple[List[L
         if not hasattr(db, 'embedding_dim'):
             db.embedding_dim = 128
 
-        # Mismatch warning
+        # Mismatch check — different embedders produce incompatible dimensions
         if db.embedder_type != expected_embedder:
-            print(f"[WARNING] Database was built with '{db.embedder_type}' embedder "
-                  f"but current CLI uses '{expected_embedder}'.")
-            print(f"[WARNING] Distances will be unreliable. Rebuild with: "
-                  f"--embedder {expected_embedder}")
+            raise ValueError(
+                f"Embedder mismatch: database was built with '{db.embedder_type}' "
+                f"({db.embedding_dim}-D) but CLI uses '{expected_embedder}'. "
+                f"Impossible to use with different dimensions.Rebuild the database with: --embedder {expected_embedder}"
+            )
 
         print(f"[INFO] Loaded database: {len(db.encodings)} employees "
               f"({db.embedding_dim}-D, embedder={db.embedder_type})")

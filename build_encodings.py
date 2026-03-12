@@ -358,7 +358,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--root", required=True, help="Root folder containing employee images (PNG/JPG)")
     parser.add_argument("--output", default="data/known_faces.pkl", help="Path to output pickle file")
-    parser.add_argument("--cascade", required=True, help="Path to Haar Cascade XML (e.g., haarcascade_frontalface_default.xml)")
+    parser.add_argument("--cascade", default="data/haarcascade_frontalface_default.xml", help="Path to Haar Cascade XML (default: data/haarcascade_frontalface_default.xml)")
     parser.add_argument("--margin", type=float, default=0.20, help="Crop margin percentage around detected face")
     parser.add_argument("--max-long-edge", type=int, default=1600, help="Resize cap for the longer image edge")
     parser.add_argument("--rebuild", action="store_true", help="Ignore any existing DB and rebuild from scratch")
