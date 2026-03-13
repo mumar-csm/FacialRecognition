@@ -73,3 +73,7 @@ Office Team Profile Pics/
 test_video.mp4
 mediamtx.yml
 threshold_analysis.png
+threshold_arcface.png
+threshold_dlib.png
+data/result_haar.jpg
+data/result_retinaface.jpg

@@ -23,9 +23,14 @@ def load_database(db_path):
     """Load EncodingsDB from pickle and return encodings array + labels list."""
     with open(db_path, "rb") as f:
         db = pickle.load(f)
+    # Backward compat: old v1 databases lack these fields
+    if not hasattr(db, 'embedder_type'):
+        db.embedder_type = "dlib"
+    if not hasattr(db, 'embedding_dim'):
+        db.embedding_dim = 128
     encodings = np.array(db.encodings)
     labels = db.labels
-    print(f"Loaded {len(labels)} encodings ({encodings.shape[1]}-D) from {db_path}")
+    print(f"Loaded {len(labels)} encodings ({db.embedding_dim}-D, {db.embedder_type}) from {db_path}")
     return encodings, labels
 
 

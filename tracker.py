@@ -6,12 +6,17 @@ but only encoding when needed (expensive). Re-identifies when faces move,
 count changes, or interval elapses.
 """
 
+from __future__ import annotations
+
 import os
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+if TYPE_CHECKING:
+    from detector_factory import FaceDetector
 
 
 DEFAULT_DETECTOR_PARAMS = {
@@ -53,20 +58,6 @@ class SimpleTracker:
         self.last_confidences: List[float] = []
         self.last_distances: List[float] = []
         self.frames_since_identify = 0
-        # Cascade caching to avoid reloading every frame
-        self._classifier: Optional[cv2.CascadeClassifier] = None
-        self._cascade_path: Optional[str] = None
-
-    def _get_classifier(self, cascade_path: str) -> cv2.CascadeClassifier:
-        """Load cascade once, reuse on subsequent calls."""
-        if self._classifier is None or self._cascade_path != cascade_path:
-            if not os.path.isfile(cascade_path):
-                raise FileNotFoundError(f"Cascade file not found: {cascade_path}")
-            self._classifier = cv2.CascadeClassifier(cascade_path)
-            if self._classifier.empty():
-                raise RuntimeError(f"Failed to load cascade: {cascade_path}")
-            self._cascade_path = cascade_path
-        return self._classifier
 
     def compute_iou(self, box1: Tuple[int, int, int, int],
                     box2: Tuple[int, int, int, int]) -> float:
@@ -195,27 +186,17 @@ class SimpleTracker:
 
         return detections
 
-    def detect_faces(self, frame: np.ndarray, cascade_path: str,
-                     detector_params: Dict[str, Any]) -> List[Tuple[int, int, int, int]]:
+    def detect_faces(self, frame: np.ndarray,
+                     detector: "FaceDetector") -> List[Tuple[int, int, int, int]]:
         """
-        Detect faces using cached classifier (fast, no encoding).
+        Detect faces using the provided detector (fast, no encoding).
 
         Args:
             frame: RGB image (numpy array)
-            cascade_path: Path to haarcascade XML
-            detector_params: Detection parameters (scale_factor, min_neighbors, min_size)
+            detector: A FaceDetector instance (HaarDetector, RetinaFaceDetector, etc.)
 
         Returns:
             List of bounding boxes in (x, y, w, h) format
         """
-        classifier = self._get_classifier(cascade_path)
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-
-        boxes = classifier.detectMultiScale(
-            gray,
-            scaleFactor=detector_params.get("scale_factor", 1.1),
-            minNeighbors=detector_params.get("min_neighbors", 5),
-            minSize=detector_params.get("min_size", (60, 60)),
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        return [tuple(box) for box in boxes]
+        detections = detector.detect(frame)
+        return [bbox for bbox, _landmarks in detections]
