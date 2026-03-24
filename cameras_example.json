@@ -1,0 +1,9 @@
+{
+  "cameras": [
+    {
+      "name": "Test Cam",
+      "rtsp_url": "rtsp://localhost:8554/stream1",
+      "location": "Local Test"
+    }
+  ]
+}
