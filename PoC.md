@@ -1,19 +1,27 @@
-# Facial Recognition System - NVR Integration & Optimization PoC
+# Facial Recognition System - PoC
 
-**Project Goal**: Add NVR/RTSP camera support, video processing, and optimize performance for 2-4 cameras with 50-200 employees.
+**Project Goal**: Build a kiosk-based facial recognition clock-in/out system for fast food restaurants (~30 stores, ~30 employees per store) to prevent ghost employees.
 
-**Approach**: Incremental delivery - Quick wins first (get NVR working), then gradual modernization (better libraries), designed for CPU with GPU-ready architecture.
+**Approach**: Incremental delivery — Phases 1-4 built the core recognition engine (video, RTSP, tracker, multi-camera, RetinaFace, ArcFace). Phases K1-K3 pivot to a kiosk-based attendance system with anti-spoofing, a tablet-friendly web UI, and audit reporting.
 
-**Timeline**: 5 weeks phased implementation
+**Architecture**: Tablet (browser) → captures frame via webcam → sends to local server → recognition pipeline → green/red result. Option 3 (audit-based logging) with upgrade path to kiosk lock enforcement.
 
 ---
 
 ## 📋 Overall Progress Tracker
 
-- [ ] Phase 1: Video & RTSP Support (Week 1)
-- [ ] Phase 2: CPU Performance Optimizations (Week 2)
-- [ ] Phase 3: Library Modernization (Weeks 3-4)
-- [x] Phase 4: Multi-Camera NVR Support (Week 5)
+### Core Engine (Complete)
+- [x] Phase 1: Video & RTSP Support
+- [x] Phase 2: CPU Performance Optimizations
+- [x] Phase 3: Library Modernization (RetinaFace + ArcFace)
+- [x] Phase 4: Multi-Camera NVR Support
+
+### Kiosk Pivot
+- [ ] Phase K1: Anti-Spoofing Integration
+- [ ] Phase K2: Kiosk Recognition App
+- [ ] Phase K3: Enrollment UI & Audit Reports
+
+### Deferred
 - [ ] Phase 5: Optional FAISS Indexing (Future)
 - [ ] Phase 6: GPU Acceleration (When GPU Available)
 
@@ -540,6 +548,251 @@ Examples:
 
 ---
 
+## Phase K1: Anti-Spoofing Integration
+
+**Goal**: Integrate liveness detection so employees can't clock in with a photo of someone else. This is the riskiest unknown — validate it works before building the kiosk UI.
+
+**Background**: InsightFace buffalo_l does NOT include anti-spoofing. Need a separate model. Top candidates from research: MiniFASNet (~98% accuracy) and Silent-Face-Anti-Spoofing (~99% accuracy). Both are lightweight CNNs that classify a face crop as real/spoof.
+
+### K1.1 Anti-Spoof Model Integration
+
+#### Tasks:
+- [ ] **Evaluate and select anti-spoofing library**
+  - [ ] Test Silent-Face-Anti-Spoofing (https://github.com/minivision-ai/Silent-Face-Anti-Spoofing)
+    - [ ] Clone repo, run inference on a test image
+    - [ ] Measure latency per frame on M4 Mac
+    - [ ] Test with phone screen photo (print attack)
+    - [ ] Test with real face (should pass)
+  - [ ] If Silent-Face doesn't work well, try MiniFASNet as fallback
+  - [ ] Choose based on: accuracy, latency (<50ms target), ease of integration
+
+- [ ] **Create anti_spoof_factory.py** (new file, follows existing factory pattern)
+  - [ ] Define `AntiSpoofChecker` Protocol class
+    - [ ] Method: `check(face_image, bbox) -> Tuple[bool, float]` (is_real, confidence)
+  - [ ] Implement selected model as a class (e.g., `SilentFaceChecker`)
+    - [ ] Init: load ONNX model, set providers (CPU/GPU)
+    - [ ] check(): preprocess crop, run inference, return (is_real, score)
+  - [ ] Implement `NoopChecker` class (always returns True — for backward compat / testing)
+  - [ ] Implement `create_anti_spoof(method, **kwargs)` factory function
+
+- [ ] **Integrate into recognition pipeline**
+  - [ ] Add anti-spoof check in `detect_and_encode_faces()` (recognize.py)
+    - [ ] After face detection, before embedding
+    - [ ] If spoof detected: skip embedding, mark as "SPOOF" in Detection result
+    - [ ] Log spoof attempts (for audit trail)
+  - [ ] Add `--anti-spoof` CLI flag in recognize.py parse_args()
+    - [ ] choices=["none", "silent-face"], default="none"
+  - [ ] Keep backward compatible: `--anti-spoof none` skips the check entirely
+
+#### Testing Checklist:
+- [ ] Real face (webcam): passes liveness, recognized correctly
+- [ ] Phone screen showing photo: detected as spoof, rejected
+- [ ] Printed photo: detected as spoof, rejected
+- [ ] Laptop screen showing photo: detected as spoof, rejected
+- [ ] Multiple real faces in frame: all pass liveness individually
+- [ ] Performance: anti-spoof adds <50ms per face on CPU
+- [ ] `--anti-spoof none` still works (no regression)
+
+#### Success Criteria:
+- [ ] Photo attacks (phone/print/screen) rejected >95% of the time
+- [ ] Real faces accepted >98% of the time
+- [ ] Latency acceptable for kiosk use (<50ms per face)
+- [ ] Clean factory pattern, consistent with detector/embedder factories
+
+---
+
+## Phase K2: Kiosk Recognition App
+
+**Goal**: Build a tablet-friendly web app for clock-in/out. Employee faces camera → system recognizes + liveness check → green/red result → attendance logged.
+
+**Architecture**: FastAPI backend (serves API + static frontend). Runs on a local machine on the store network. Tablet connects via browser.
+
+### K2.1 Recognition API
+
+#### Tasks:
+- [ ] **Create kiosk_server.py** (new file — FastAPI app)
+  - [ ] On startup: load face database, create detector, embedder, anti-spoof checker
+    - [ ] Use RetinaFace + ArcFace + anti-spoof as defaults
+    - [ ] Configurable via environment variables or config file
+  - [ ] **POST /api/recognize** endpoint
+    - [ ] Accept: base64-encoded JPEG frame (from browser webcam)
+    - [ ] Pipeline: decode → detect face → anti-spoof check → embed → match → log
+    - [ ] Enforce single-face: reject if 0 or >1 faces detected
+    - [ ] Return JSON: `{status, identity, confidence, distance, is_live, message}`
+    - [ ] Status values: "recognized", "unknown", "spoof_detected", "no_face", "multiple_faces"
+  - [ ] **GET /api/health** endpoint
+    - [ ] Return: model status, database info (employee count, embedder type)
+  - [ ] **GET /api/attendance** endpoint
+    - [ ] Return: today's attendance log (list of clock-in events)
+    - [ ] Query param: `?date=YYYY-MM-DD` for other dates
+
+- [ ] **Create SQLite attendance schema**
+  - [ ] Table: `attendance` (id, timestamp, identity, confidence, distance, is_clock_in, camera_id)
+  - [ ] Index on timestamp, identity
+  - [ ] Dedup: suppress duplicate logs for same person within configurable window (e.g., 5 min)
+  - [ ] Reuse WAL mode pattern from recognize_multi.py
+
+- [ ] **Add cooldown logic**
+  - [ ] After successful recognition, suppress same person for N minutes (configurable)
+  - [ ] Prevents accidental double clock-in
+  - [ ] In-memory dict: `{identity: last_seen_timestamp}`
+
+#### Testing Checklist:
+- [ ] POST valid frame with known face → "recognized" + correct identity
+- [ ] POST frame with unknown face → "unknown"
+- [ ] POST frame with no face → "no_face"
+- [ ] POST frame with multiple faces → "multiple_faces"
+- [ ] POST spoof (phone photo) → "spoof_detected"
+- [ ] Duplicate clock-in within cooldown → suppressed
+- [ ] GET /api/health → returns model info
+- [ ] GET /api/attendance → returns today's log
+- [ ] Server handles concurrent requests without crashing
+
+#### Success Criteria:
+- [ ] End-to-end recognition in <500ms per request (detect + anti-spoof + embed + match)
+- [ ] Correct JSON responses for all scenarios
+- [ ] Attendance logged to SQLite accurately
+- [ ] Cooldown prevents double-logging
+
+---
+
+### K2.2 Kiosk Web Frontend
+
+#### Tasks:
+- [ ] **Create static/ directory** with kiosk UI files
+  - [ ] `index.html` — single-page kiosk interface
+  - [ ] `kiosk.js` — webcam capture + API interaction
+  - [ ] `kiosk.css` — tablet-friendly styling
+
+- [ ] **Webcam integration** (kiosk.js)
+  - [ ] Use `navigator.mediaDevices.getUserMedia()` for camera access
+  - [ ] Show live camera feed in `<video>` element
+  - [ ] Auto-capture: take snapshot every N seconds (e.g., 2s) while active
+    - [ ] Or manual: "Clock In" button triggers capture
+    - [ ] Decide based on UX testing — start with button, switch to auto if better
+  - [ ] Capture frame to canvas, convert to base64 JPEG
+  - [ ] POST to `/api/recognize`
+  - [ ] Display result
+
+- [ ] **Result display**
+  - [ ] Recognized: green overlay/animation + "Welcome, [Name]!" + timestamp
+  - [ ] Unknown: red overlay + "Not recognized — see manager"
+  - [ ] Spoof detected: red overlay + "Please use your real face"
+  - [ ] No face: neutral prompt "Position your face in the frame"
+  - [ ] Auto-reset to camera feed after 3-4 seconds
+
+- [ ] **Tablet-friendly design**
+  - [ ] Full-screen layout, large text, high contrast
+  - [ ] Works in landscape and portrait
+  - [ ] No scrolling needed — everything visible at once
+  - [ ] Touch-friendly buttons (minimum 48px tap targets)
+
+- [ ] **Serve frontend from FastAPI**
+  - [ ] Mount static/ directory via `app.mount("/", StaticFiles(...))`
+  - [ ] Root URL serves kiosk UI
+
+#### Testing Checklist:
+- [ ] Opens in mobile browser (Chrome/Safari) on tablet
+- [ ] Camera permission prompt appears and works
+- [ ] Live camera feed is visible
+- [ ] Capture + recognize flow works end-to-end
+- [ ] Green/red result displays correctly
+- [ ] Auto-resets after result display
+- [ ] Works in both landscape and portrait orientation
+- [ ] Usable without keyboard (touch only)
+
+#### Success Criteria:
+- [ ] Non-technical employee can clock in without instructions
+- [ ] Full flow (approach → capture → result) takes <5 seconds
+- [ ] Clear visual feedback for all outcomes
+- [ ] Works on iPad/Android tablet in browser
+
+---
+
+## Phase K3: Enrollment UI & Audit Reports
+
+**Goal**: Store managers can enroll new employees via web UI and view attendance reports. Replaces CLI-only enrollment with something a non-technical user can operate.
+
+### K3.1 Web-Based Enrollment
+
+#### Tasks:
+- [ ] **POST /api/enroll** endpoint (in kiosk_server.py)
+  - [ ] Accept: base64 JPEG photo + employee name/ID
+  - [ ] Pipeline: decode → detect face → enforce single face → anti-spoof → embed → save
+  - [ ] Save photo to `data/employees/{employee_id}.jpg`
+  - [ ] Rebuild face database (append new encoding to existing .pkl)
+    - [ ] Hot-reload: update in-memory database without server restart
+  - [ ] Return: success/failure + reason
+
+- [ ] **DELETE /api/enroll/{employee_id}** endpoint
+  - [ ] Remove employee from database
+  - [ ] Delete photo file
+  - [ ] Hot-reload database
+
+- [ ] **GET /api/employees** endpoint
+  - [ ] Return list of enrolled employees (name, enrollment date, photo thumbnail)
+
+- [ ] **Enrollment web page** (static/enroll.html)
+  - [ ] Simple form: employee name/ID + capture photo from webcam
+  - [ ] Or: upload existing photo
+  - [ ] Show confirmation with detected face crop
+  - [ ] Manager-only access (basic password protection for PoC — proper auth later)
+
+#### Testing Checklist:
+- [ ] Enroll new employee via web UI → appears in employee list
+- [ ] New employee can immediately clock in (hot-reload works)
+- [ ] Reject enrollment photo with 0 or >1 faces
+- [ ] Reject spoof photo during enrollment
+- [ ] Delete employee → can no longer clock in
+- [ ] Password protection prevents unauthorized enrollment
+
+#### Success Criteria:
+- [ ] Store manager can enroll a new employee in <1 minute
+- [ ] No CLI or technical knowledge required
+- [ ] Database stays consistent after add/delete operations
+
+---
+
+### K3.2 Attendance Reports
+
+#### Tasks:
+- [ ] **GET /api/report** endpoint
+  - [ ] Query params: `?start=YYYY-MM-DD&end=YYYY-MM-DD&employee=NAME`
+  - [ ] Return: attendance records (JSON)
+  - [ ] Include: timestamp, identity, confidence, clock-in/out status
+
+- [ ] **GET /api/report/csv** endpoint
+  - [ ] Same filters as above
+  - [ ] Return: CSV download for manual POS comparison
+  - [ ] Columns: Date, Time, Employee, Confidence, Event Type
+
+- [ ] **Report web page** (static/report.html)
+  - [ ] Date range picker
+  - [ ] Filter by employee (dropdown)
+  - [ ] Table view of attendance records
+  - [ ] "Export CSV" button
+  - [ ] Summary stats: total clock-ins today, unique employees, flagged events
+
+- [ ] **Anomaly flags** (basic)
+  - [ ] Flag: employee clocked in at unusual time (outside configured shift window)
+  - [ ] Flag: spoof attempts (logged from K1)
+  - [ ] Flag: unrecognized face attempts (potential unauthorized person)
+  - [ ] These are informational flags, not enforcement — matches Option 3 approach
+
+#### Testing Checklist:
+- [ ] Report page shows attendance data for selected date range
+- [ ] Employee filter works correctly
+- [ ] CSV export downloads valid file
+- [ ] Anomaly flags appear for spoof attempts
+- [ ] Report loads quickly even with 1000+ records
+
+#### Success Criteria:
+- [ ] Manager can view "who clocked in today" in <10 seconds
+- [ ] CSV export is compatible with Excel for manual POS comparison
+- [ ] Anomaly flags surface suspicious activity without false alarm noise
+
+---
+
 ## Phase 5: Optional FAISS Indexing (Future Enhancement)
 
 **Status**: Deferred - Not needed for 50-200 employees. Current brute-force search is fast enough (~5-10ms).
@@ -805,6 +1058,6 @@ When `should_reidentify()` returns True, `tracker.detect_faces()` has already ru
 
 ---
 
-**Last Updated**: 2026-03-06
-**Status**: Phase 1 Complete (auth deferred), Phase 2 Complete (perf testing deferred — needs larger dataset, ROC/EER deferred — needs multiple photos per person).
-**Next Action**: Phase 3 (Library Modernization — RetinaFace + ArcFace)
+**Last Updated**: 2026-03-25
+**Status**: Phases 1-4 complete (core engine). Pivoting to kiosk-based clock-in/out system.
+**Next Action**: Phase K1 (Anti-Spoofing Integration)

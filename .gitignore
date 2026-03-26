@@ -31,6 +31,9 @@ data/*.pkl
 # Haar Cascade model (large file, available from OpenCV)
 data/haarcascade_frontalface_default.xml
 
+# ONNX models (binary, downloaded at setup)
+models/
+
 # Debug/test scripts (temporary troubleshooting files)
 debug_image.py
 test_script.py
