@@ -14,6 +14,8 @@ Usage:
 import argparse
 import base64
 import os
+import pickle
+import re
 import sqlite3
 import sys
 import time
@@ -164,6 +166,23 @@ def purge_old_records(conn: sqlite3.Connection,
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Enrollment persistence
+# ═══════════════════════════════════════════════════════════════════════
+
+def save_encoding_to_pkl(db_path: str, embedding: np.ndarray, label: str) -> None:
+    """Append one encoding to the pkl file on disk using atomic write."""
+    with open(db_path, "rb") as f:
+        db = pickle.load(f)
+    db.encodings.append(embedding.tolist())
+    db.labels.append(label)
+    db.meta.append({"source": "kiosk_enrollment", "label": label})
+    tmp_path = db_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(db, f)
+    os.replace(tmp_path, db_path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # CLI argument parsing
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -274,6 +293,18 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # Pydantic Models
 # ═══════════════════════════════════════════════════════════════════════
 
+class EnrollRequest(BaseModel):
+    image: str        # base64-encoded JPEG (with or without data URI prefix)
+    first_name: str
+    last_name: str
+
+
+class EnrollResponse(BaseModel):
+    status: str  # enrolled, already_exists, no_face, multiple_faces, spoof_detected, error
+    message: str = ""
+    employee_name: str = ""  # stored as firstname_lastname
+
+
 class RecognizeRequest(BaseModel):
     image: str  # base64-encoded JPEG (with or without data URI prefix)
     camera_id: Optional[str] = None
@@ -300,6 +331,12 @@ class RecognizeResponse(BaseModel):
 async def serve_index():
     """Serve the kiosk frontend."""
     return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/enroll")
+async def serve_enroll():
+    """Serve the enrollment page."""
+    return FileResponse(str(STATIC_DIR / "enroll.html"))
 
 
 @app.get("/api/health")
@@ -513,10 +550,114 @@ async def recognize(request: Request, body: RecognizeRequest):
     )
 
 
-# ── K3 stubs (enrollment — implemented in Phase K3) ──
-# POST /api/enroll — add new employee
-# DELETE /api/enroll/{employee_id} — soft-delete employee
-# GET /api/employees — list active employees
+@app.post("/api/enroll")
+async def enroll(request: Request, body: EnrollRequest):
+    """Enroll a new employee via live camera capture."""
+    state = request.app.state
+
+    # ── Validate and sanitize name (prevent path traversal) ──
+    first = re.sub(r"[^a-zA-Z\s-]", "", body.first_name).strip().lower()
+    last = re.sub(r"[^a-zA-Z\s-]", "", body.last_name).strip().lower()
+    if not first or not last:
+        return EnrollResponse(status="error", message="First and last name are required (letters, spaces, hyphens only).")
+
+    first = re.sub(r"\s+", "_", first)
+    last = re.sub(r"\s+", "_", last)
+    employee_name = f"{first}_{last}"
+
+    # ── Check duplicate ──
+    if employee_name in state.known_labels:
+        return EnrollResponse(
+            status="already_exists",
+            message="This employee is already enrolled.",
+        )
+
+    # ── Decode image ──
+    try:
+        image_data = body.image
+        if "," in image_data and image_data.index(",") < 100:
+            image_data = image_data.split(",", 1)[1]
+        raw_bytes = base64.b64decode(image_data)
+        np_arr = np.frombuffer(raw_bytes, np.uint8)
+        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            return EnrollResponse(status="error", message="Failed to decode image.", employee_name=employee_name)
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        return EnrollResponse(status="error", message=f"Image decode failed: {e}", employee_name=employee_name)
+
+    # ── Detect face ──
+    detections = state.detector.detect(frame_rgb)
+    if len(detections) == 0:
+        return EnrollResponse(status="no_face", message="No face detected — try again.", employee_name=employee_name)
+    if len(detections) > 1:
+        return EnrollResponse(
+            status="multiple_faces",
+            message="Multiple faces detected — only you should be in frame.",
+            employee_name=employee_name,
+        )
+
+    (x, y, w, h), landmarks = detections[0]
+
+    # ── Anti-spoof check ──
+    if state.anti_spoof is not None:
+        face_crop = frame_rgb[y:y+h, x:x+w]
+        if face_crop.size > 0:
+            is_real, spoof_score = state.anti_spoof.check(face_crop)
+            if not is_real:
+                return EnrollResponse(
+                    status="spoof_detected",
+                    message="Liveness check failed — use your real face.",
+                    employee_name=employee_name,
+                )
+
+    # ── Align face ──
+    if state.do_align and landmarks is not None:
+        aligned = align_face(frame_rgb, landmarks, 112)
+        aligned = np.ascontiguousarray(aligned)
+    else:
+        face_roi = frame_rgb[y:y+h, x:x+w]
+        aligned = np.ascontiguousarray(face_roi) if face_roi.size > 0 else None
+
+    if aligned is None:
+        return EnrollResponse(status="error", message="Face alignment failed.", employee_name=employee_name)
+
+    # ── Embed ──
+    embedding = state.embedder.embed(aligned)
+    if embedding is None:
+        return EnrollResponse(status="error", message="Embedding extraction failed.", employee_name=employee_name)
+
+    # ── Persist to pkl (before in-memory and photo — safer ordering) ──
+    try:
+        save_encoding_to_pkl(args.database, embedding, employee_name)
+    except Exception as e:
+        return EnrollResponse(status="error", message=f"Failed to save encoding: {e}", employee_name=employee_name)
+
+    # ── Save photo (after pkl — no orphan files on failure) ──
+    employees_dir = Path(args.database).parent / "employees"
+    employees_dir.mkdir(parents=True, exist_ok=True)
+    photo_file = employees_dir / f"{employee_name}.jpg"
+    cv2.imwrite(str(photo_file), frame_bgr)
+
+    # ── Hot-reload in-memory ──
+    state.known_encodings.append(embedding.tolist())
+    state.known_labels.append(employee_name)
+
+    # ── Insert into employees table ──
+    ts = datetime.now(timezone.utc).isoformat()
+    state.db_conn.execute(
+        "INSERT OR IGNORE INTO employees (id, name, enrolled_at, photo_path, is_active) "
+        "VALUES (?, ?, ?, ?, 1)",
+        (employee_name, f"{first} {last}", ts, str(photo_file)),
+    )
+    state.db_conn.commit()
+
+    print(f"[ENROLL] {employee_name} enrolled successfully")
+    return EnrollResponse(
+        status="enrolled",
+        message=f"{employee_name} enrolled successfully!",
+        employee_name=employee_name,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
