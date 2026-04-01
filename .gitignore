@@ -84,3 +84,14 @@ data/detections.db
 
 #--- Multi-camera test files ---
 cameras_test_multi.json
+
+#--- Kiosk runtime DB ---
+data/kiosk.db
+data/kiosk.db-wal
+data/kiosk.db-shm
+
+#--- Internal planning docs ---
+roadmap.md
+
+#--- Tests ---
+tests/
