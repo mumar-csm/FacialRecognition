@@ -12,3 +12,8 @@ scikit-learn>=1.0.0
 insightface>=0.7.3
 onnxruntime>=1.14.0
 scikit-image>=0.19.0
+
+# Phase K2 — Kiosk web server
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+python-multipart>=0.0.6

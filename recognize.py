@@ -28,6 +28,9 @@ from visualization import draw_annotations
 # Import detector factory
 from detector_factory import create_detector, align_face, FaceDetector
 
+# Import anti-spoofing factory
+from anti_spoof_factory import create_anti_spoof
+
 
 def load_database(db_path: str, expected_embedder: str = "dlib") -> Tuple[List[List[float]], List[str]]:
     """
@@ -127,26 +130,38 @@ def find_best_match(unknown_encoding: np.ndarray,
 def detect_and_encode_faces(frame: np.ndarray,
                             detector: FaceDetector,
                             do_align: bool = False,
-                            embedder=None) -> List[Tuple[Tuple[int, int, int, int], np.ndarray]]:
+                            embedder=None,
+                            anti_spoof=None) -> List[Tuple[Tuple[int, int, int, int], np.ndarray, bool]]:
     """
-    Detect faces in frame and compute embeddings
+    Detect faces in frame, run anti-spoof check, and compute embeddings
 
     Args:
         frame: RGB image (numpy array)
         detector: A FaceDetector instance (HaarDetector, RetinaFaceDetector, etc.)
         do_align: If True and landmarks are available, align face before encoding
         embedder: A FaceEmbedder instance (DlibEmbedder, ArcFaceEmbedder, etc.)
+        anti_spoof: An AntiSpoofChecker instance (or None to skip liveness check)
 
     Returns:
-        List of (bbox, encoding) tuples
+        List of (bbox, encoding, is_spoof) tuples
         bbox: (x, y, w, h)
-        encoding: numpy array (128-d or 512-d depending on embedder)
+        encoding: numpy array (128-d or 512-d depending on embedder), or None if spoof
+        is_spoof: True if the face was classified as a spoof
     """
     detections = detector.detect(frame)
     results = []
 
     for (x, y, w, h), landmarks in detections:
         try:
+            # Anti-spoof check (before embedding to save compute on spoofs)
+            if anti_spoof is not None:
+                face_crop = frame[y:y+h, x:x+w]
+                if face_crop.size > 0:
+                    is_real, _conf = anti_spoof.check(face_crop)
+                    if not is_real:
+                        results.append(((x, y, w, h), None, True))
+                        continue
+
             vec = None
             if do_align and landmarks is not None:
                 aligned = align_face(frame, landmarks)
@@ -166,7 +181,7 @@ def detect_and_encode_faces(frame: np.ndarray,
                     vec = embedder.embed(face_roi)
 
             if vec is not None:
-                results.append(((x, y, w, h), vec))
+                results.append(((x, y, w, h), vec, False))
 
         except Exception as e:
             print(f"[WARN] Encoding failed for face at ({x},{y}): {e}")
@@ -182,9 +197,10 @@ def process_frame(frame: np.ndarray,
                  detector: FaceDetector,
                  threshold: float = 1.0,
                  do_align: bool = False,
-                 embedder=None) -> List[Detection]:
+                 embedder=None,
+                 anti_spoof=None) -> List[Detection]:
     """
-    Process a single frame: detect faces, encode, and match
+    Process a single frame: detect faces, anti-spoof check, encode, and match
 
     Args:
         frame: RGB image (numpy array)
@@ -194,18 +210,22 @@ def process_frame(frame: np.ndarray,
         threshold: Matching threshold
         do_align: If True, align faces using landmarks before encoding
         embedder: A FaceEmbedder instance
+        anti_spoof: An AntiSpoofChecker instance (or None to skip liveness check)
 
     Returns:
         List of Detection objects
     """
-    # Detect and encode faces
-    face_data = detect_and_encode_faces(frame, detector, do_align, embedder)
+    # Detect, anti-spoof check, and encode faces
+    face_data = detect_and_encode_faces(frame, detector, do_align, embedder, anti_spoof)
 
     # Match each face
     detections = []
-    for (bbox, encoding) in face_data:
-        label, distance, confidence = find_best_match(encoding, known_encodings, labels, threshold)
-        detection = Detection(bbox=bbox, label=label, distance=distance, confidence=confidence)
+    for (bbox, encoding, is_spoof) in face_data:
+        if is_spoof:
+            detection = Detection(bbox=bbox, label="SPOOF", distance=0.0, confidence=0.0)
+        else:
+            label, distance, confidence = find_best_match(encoding, known_encodings, labels, threshold)
+            detection = Detection(bbox=bbox, label=label, distance=distance, confidence=confidence)
         detections.append(detection)
 
     return detections
@@ -223,7 +243,8 @@ def recognize_from_webcam(db_path: str,
                          do_align: bool = False,
                          embedder_type: str = "dlib",
                          model_name: str = "buffalo_l",
-                         ctx_id: int = -1) -> None:
+                         ctx_id: int = -1,
+                         anti_spoof_type: str = "none") -> None:
     """
     Real-time face recognition from webcam
 
@@ -240,13 +261,15 @@ def recognize_from_webcam(db_path: str,
         embedder_type: Embedding backend ("dlib" or "arcface")
         model_name: InsightFace model pack name (default: buffalo_l)
         ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
+        anti_spoof_type: Anti-spoofing method ("none" or "minifas")
     """
     # Load database
     print("[INFO] Loading face database...")
     known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
 
-    # Create embedder
+    # Create embedder and anti-spoof checker
     embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
+    anti_spoof = create_anti_spoof(anti_spoof_type)
 
     # Open webcam
     print(f"[INFO] Opening camera {camera_index}...")
@@ -286,7 +309,7 @@ def recognize_from_webcam(db_path: str,
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
-                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
+                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder, anti_spoof)
                 # Update tracker cache
                 tracker.update(
                     boxes=[d.bbox for d in detections],
@@ -334,7 +357,8 @@ def recognize_from_image(image_path: str,
                         do_align: bool = False,
                         embedder_type: str = "dlib",
                         model_name: str = "buffalo_l",
-                        ctx_id: int = -1) -> List[Detection]:
+                        ctx_id: int = -1,
+                        anti_spoof_type: str = "none") -> List[Detection]:
     """
     Face recognition on a single image
 
@@ -350,6 +374,7 @@ def recognize_from_image(image_path: str,
         embedder_type: Embedding backend ("dlib" or "arcface")
         model_name: InsightFace model pack name (default: buffalo_l)
         ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
+        anti_spoof_type: Anti-spoofing method ("none" or "minifas")
 
     Returns:
         List of Detection objects
@@ -358,8 +383,9 @@ def recognize_from_image(image_path: str,
     print("[INFO] Loading face database...")
     known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
 
-    # Create embedder
+    # Create embedder and anti-spoof checker
     embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
+    anti_spoof = create_anti_spoof(anti_spoof_type)
 
     # Load image
     print(f"[INFO] Loading image: {image_path}")
@@ -376,7 +402,7 @@ def recognize_from_image(image_path: str,
     # Process frame
     print("[INFO] Processing image...")
     detector = create_detector(detector_type, cascade_path=cascade_path)
-    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
+    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder, anti_spoof)
 
     print(f"[INFO] Detected {len(detections)} face(s)")
     for det in detections:
@@ -412,7 +438,8 @@ def recognize_from_video(video_path: str,
                         do_align: bool = False,
                         embedder_type: str = "dlib",
                         model_name: str = "buffalo_l",
-                        ctx_id: int = -1) -> Dict[str, Any]:
+                        ctx_id: int = -1,
+                        anti_spoof_type: str = "none") -> Dict[str, Any]:
     """
     Face recognition on video file
 
@@ -431,6 +458,7 @@ def recognize_from_video(video_path: str,
         embedder_type: Embedding backend ("dlib" or "arcface")
         model_name: InsightFace model pack name (default: buffalo_l)
         ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
+        anti_spoof_type: Anti-spoofing method ("none" or "minifas")
 
     Returns:
         Dictionary with statistics:
@@ -443,8 +471,9 @@ def recognize_from_video(video_path: str,
     print("[INFO] Loading face database...")
     known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
 
-    # Create embedder
+    # Create embedder and anti-spoof checker
     embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
+    anti_spoof = create_anti_spoof(anti_spoof_type)
 
     # Warn if no output and no display
     if not output_path and not display:
@@ -528,7 +557,7 @@ def recognize_from_video(video_path: str,
 
             if tracker.should_reidentify(current_boxes):
                 # Full recognition (expensive) - only when needed
-                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
+                detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder, anti_spoof)
                 # Update tracker cache
                 tracker.update(
                     boxes=[d.bbox for d in detections],
@@ -605,7 +634,8 @@ def recognize_from_rtsp(rtsp_url: str,
                         do_align: bool = False,
                         embedder_type: str = "dlib",
                         model_name: str = "buffalo_l",
-                        ctx_id: int = -1) -> None:
+                        ctx_id: int = -1,
+                        anti_spoof_type: str = "none") -> None:
     """
     Real-time face recognition from RTSP stream
 
@@ -623,13 +653,15 @@ def recognize_from_rtsp(rtsp_url: str,
         embedder_type: Embedding backend ("dlib" or "arcface")
         model_name: InsightFace model pack name (default: buffalo_l)
         ctx_id: GPU device ID (-1 for CPU, 0+ for GPU)
+        anti_spoof_type: Anti-spoofing method ("none" or "minifas")
     """
     # Load face database (once, outside retry loop)
     print("[INFO] Loading face database...")
     known_encodings, labels = load_database(db_path, expected_embedder=embedder_type)
 
-    # Create embedder
+    # Create embedder and anti-spoof checker
     embedder = create_embedder(embedder_type, model_name=model_name, ctx_id=ctx_id)
+    anti_spoof = create_anti_spoof(anti_spoof_type)
 
     # Configure FFMPEG for RTSP: TCP transport + 10 second timeout (once)
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|timeout;10000000"
@@ -693,7 +725,7 @@ def recognize_from_rtsp(rtsp_url: str,
 
                 if tracker.should_reidentify(current_boxes):
                     # Full recognition (expensive) - only when needed
-                    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder)
+                    detections = process_frame(frame_rgb, known_encodings, labels, detector, threshold, do_align, embedder, anti_spoof)
                     # Update tracker cache
                     tracker.update(
                         boxes=[d.bbox for d in detections],
@@ -826,6 +858,9 @@ Examples:
     parser.add_argument("--gpu", type=int, default=-1,
                        help="GPU device ID (-1 for CPU, 0+ for GPU)")
 
+    parser.add_argument("--anti-spoof", choices=["none", "minifas"], default="none",
+                       help="Anti-spoofing method (default: none)")
+
     return parser.parse_args()
 
 
@@ -852,7 +887,8 @@ def main():
                     do_align=args.align,
                     embedder_type=args.embedder,
                     model_name=args.model,
-                    ctx_id=args.gpu
+                    ctx_id=args.gpu,
+                    anti_spoof_type=args.anti_spoof
                 )
             else:
                 # Webcam mode
@@ -874,7 +910,8 @@ def main():
                     do_align=args.align,
                     embedder_type=args.embedder,
                     model_name=args.model,
-                    ctx_id=args.gpu
+                    ctx_id=args.gpu,
+                    anti_spoof_type=args.anti_spoof
                 )
 
         elif args.mode == "image":
@@ -894,7 +931,8 @@ def main():
                 do_align=args.align,
                 embedder_type=args.embedder,
                 model_name=args.model,
-                ctx_id=args.gpu
+                ctx_id=args.gpu,
+                anti_spoof_type=args.anti_spoof
             )
 
         elif args.mode == "video":
@@ -917,7 +955,8 @@ def main():
                 do_align=args.align,
                 embedder_type=args.embedder,
                 model_name=args.model,
-                ctx_id=args.gpu
+                ctx_id=args.gpu,
+                anti_spoof_type=args.anti_spoof
             )
 
     except KeyboardInterrupt:

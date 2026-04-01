@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+"""
+Phase K2 — Kiosk Recognition Server
+
+FastAPI-based kiosk for employee clock-in/out via facial recognition.
+Loads all ML models once at startup, serves a browser-based frontend,
+and exposes REST endpoints for recognition and attendance.
+
+Usage:
+    python kiosk_server.py --database data/known_faces_arcface.pkl
+    python kiosk_server.py --database data/known_faces_arcface.pkl --threshold 0.9 --cooldown 120
+"""
+
+import argparse
+import base64
+import os
+import sqlite3
+import sys
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# ── Reuse existing pipeline components ──
+from anti_spoof_factory import create_anti_spoof
+from build_encodings import EncodingsDB
+from detector_factory import FaceDetector, align_face, create_detector
+from embedding_factory import create_embedder
+from euclideanDist import euclidean_distance
+from liveness import LivenessManager, SessionState
+from recognize import find_best_match, load_database
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SQLite Database Layer
+# ═══════════════════════════════════════════════════════════════════════
+
+def init_kiosk_db(db_path: str) -> sqlite3.Connection:
+    """Create kiosk tables and indexes, enable WAL mode. Returns open connection."""
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS employees (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            enrolled_at TEXT NOT NULL,
+            photo_path  TEXT,
+            is_active   INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS attendance (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            employee_id TEXT NOT NULL,
+            distance    REAL NOT NULL,
+            is_clock_in INTEGER NOT NULL,
+            camera_id   TEXT NOT NULL DEFAULT 'kiosk-01',
+            FOREIGN KEY (employee_id) REFERENCES employees(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS spoof_attempts (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            camera_id   TEXT NOT NULL DEFAULT 'kiosk-01',
+            spoof_score REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_attendance_timestamp ON attendance(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_attendance_employee  ON attendance(employee_id);
+        CREATE INDEX IF NOT EXISTS idx_spoof_timestamp      ON spoof_attempts(timestamp);
+    """)
+    conn.commit()
+    return conn
+
+
+def log_attendance(conn: sqlite3.Connection, employee_id: str,
+                   distance: float, is_clock_in: bool, camera_id: str = "kiosk-01") -> int:
+    """Insert an attendance record. Returns the inserted row ID."""
+    ts = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "INSERT INTO attendance (timestamp, employee_id, distance, is_clock_in, camera_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (ts, employee_id, distance, int(is_clock_in), camera_id),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def log_spoof_attempt(conn: sqlite3.Connection, camera_id: str, spoof_score: float) -> int:
+    """Insert a spoof attempt record. Returns the inserted row ID."""
+    ts = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        "INSERT INTO spoof_attempts (timestamp, camera_id, spoof_score) VALUES (?, ?, ?)",
+        (ts, camera_id, spoof_score),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def get_last_attendance(conn: sqlite3.Connection, employee_id: str,
+                        today_date: str) -> Optional[Dict]:
+    """Get the most recent attendance record for an employee today.
+
+    Args:
+        today_date: "YYYY-MM-DD" — used for LIKE matching on timestamp.
+    Returns:
+        dict with is_clock_in field, or None if no records today.
+    """
+    row = conn.execute(
+        "SELECT id, timestamp, employee_id, distance, is_clock_in, camera_id "
+        "FROM attendance "
+        "WHERE employee_id = ? AND timestamp LIKE ? "
+        "ORDER BY timestamp DESC LIMIT 1",
+        (employee_id, f"{today_date}%"),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row[0], "timestamp": row[1], "employee_id": row[2],
+        "distance": row[3], "is_clock_in": bool(row[4]), "camera_id": row[5],
+    }
+
+
+def get_attendance_by_date(conn: sqlite3.Connection, date: str) -> List[Dict]:
+    """Get all attendance records for a given date (YYYY-MM-DD)."""
+    rows = conn.execute(
+        "SELECT a.id, a.timestamp, a.employee_id, a.distance, a.is_clock_in, a.camera_id "
+        "FROM attendance a "
+        "WHERE a.timestamp LIKE ? "
+        "ORDER BY a.timestamp",
+        (f"{date}%",),
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "timestamp": r[1], "employee_id": r[2],
+            "distance": r[3], "is_clock_in": bool(r[4]), "camera_id": r[5],
+        }
+        for r in rows
+    ]
+
+
+def purge_old_records(conn: sqlite3.Connection,
+                      attendance_days: int = 365,
+                      spoof_days: int = 90) -> Tuple[int, int]:
+    """Delete records older than retention window. Returns (attendance_deleted, spoof_deleted)."""
+    att_cutoff = (datetime.now(timezone.utc) - timedelta(days=attendance_days)).isoformat()
+    spoof_cutoff = (datetime.now(timezone.utc) - timedelta(days=spoof_days)).isoformat()
+
+    c1 = conn.execute("DELETE FROM attendance WHERE timestamp < ?", (att_cutoff,))
+    c2 = conn.execute("DELETE FROM spoof_attempts WHERE timestamp < ?", (spoof_cutoff,))
+    conn.commit()
+    return c1.rowcount, c2.rowcount
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CLI argument parsing
+# ═══════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Kiosk Recognition Server (K2)")
+    p.add_argument("--database", default="data/known_faces_arcface.pkl",
+                   help="Path to face encodings pkl file")
+    p.add_argument("--sqlite", default="data/kiosk.db",
+                   help="Path to SQLite database")
+    p.add_argument("--detector", choices=["haar", "retinaface"], default="retinaface")
+    p.add_argument("--embedder", choices=["dlib", "arcface"], default="arcface")
+    p.add_argument("--anti-spoof", choices=["none", "minifas"], default="minifas",
+                   dest="anti_spoof")
+    p.add_argument("--threshold", type=float, default=1.0,
+                   help="Distance threshold for face match")
+    p.add_argument("--cooldown", type=int, default=120,
+                   help="Cooldown between duplicate clock events (seconds)")
+    p.add_argument("--consensus", type=int, default=3,
+                   help="Consecutive frames required to confirm identity before liveness challenge (default: 3)")
+    p.add_argument("--spoof-threshold", type=float, default=0.75,
+                   dest="spoof_threshold",
+                   help="Anti-spoof probability threshold (0-1, higher=stricter, default: 0.75)")
+    p.add_argument("--challenge-timeout", type=float, default=8.0,
+                   dest="challenge_timeout",
+                   help="Seconds allowed for liveness challenge (default: 8.0)")
+    p.add_argument("--camera-id", default="kiosk-01",
+                   help="Identifier for this kiosk instance")
+    p.add_argument("--retention-days", type=int, default=365,
+                   help="Attendance record retention (days)")
+    p.add_argument("--spoof-retention-days", type=int, default=90,
+                   help="Spoof attempt record retention (days)")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--port", type=int, default=8000)
+    return p.parse_args()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Global config (populated by parse_args at module load)
+# ═══════════════════════════════════════════════════════════════════════
+
+args = parse_args()
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FastAPI App + Lifespan
+# ═══════════════════════════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load all ML models and database once at startup."""
+    print("[STARTUP] Loading models and database...")
+
+    # ML pipeline
+    app.state.detector = create_detector(args.detector)
+    app.state.embedder = create_embedder(args.embedder)
+    app.state.anti_spoof = create_anti_spoof(
+        args.anti_spoof,
+        **({"threshold": args.spoof_threshold} if args.anti_spoof != "none" else {}),
+    )
+    app.state.do_align = (args.detector == "retinaface")
+
+    # Face encodings
+    encodings, labels = load_database(args.database, expected_embedder=args.embedder)
+    app.state.known_encodings = encodings
+    app.state.known_labels = labels
+
+    # SQLite
+    app.state.db_conn = init_kiosk_db(args.sqlite)
+    att_del, spoof_del = purge_old_records(
+        app.state.db_conn, args.retention_days, args.spoof_retention_days
+    )
+    if att_del or spoof_del:
+        print(f"[STARTUP] Purged {att_del} old attendance, {spoof_del} old spoof records")
+
+    # In-memory cooldown tracker
+    app.state.cooldown: Dict[str, float] = {}
+
+    # Consensus tracker for identity confirmation (pre-challenge)
+    app.state.pending: Dict[str, Dict] = {}
+
+    # Liveness challenge manager
+    app.state.liveness = LivenessManager(challenge_timeout=args.challenge_timeout)
+
+    # Config accessible to endpoints
+    app.state.threshold = args.threshold
+    app.state.cooldown_seconds = args.cooldown
+    app.state.consensus_required = args.consensus
+    app.state.camera_id = args.camera_id
+
+    print(f"[STARTUP] Ready — {len(labels)} employees, threshold={args.threshold}, "
+          f"cooldown={args.cooldown}s, consensus={args.consensus} frames, "
+          f"spoof_threshold={args.spoof_threshold}, challenge_timeout={args.challenge_timeout}s")
+    yield
+
+    # Shutdown
+    app.state.db_conn.commit()
+    app.state.db_conn.close()
+    print("[SHUTDOWN] Database connection closed.")
+
+
+app = FastAPI(title="Kiosk Recognition Server", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Pydantic Models
+# ═══════════════════════════════════════════════════════════════════════
+
+class RecognizeRequest(BaseModel):
+    image: str  # base64-encoded JPEG (with or without data URI prefix)
+    camera_id: Optional[str] = None
+
+
+class RecognizeResponse(BaseModel):
+    status: str  # recognized, verifying, liveness_challenge, no_face, multiple_faces, spoof_detected, unknown, cooldown
+    identity: Optional[str] = None
+    distance: Optional[float] = None
+    is_clock_in: Optional[bool] = None
+    consensus_progress: Optional[int] = None
+    consensus_required: Optional[int] = None
+    challenge_type: Optional[str] = None  # "blink" or "nod"
+    challenge_instruction: Optional[str] = None
+    challenge_time_remaining: Optional[float] = None
+    message: str = ""
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Routes
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+async def serve_index():
+    """Serve the kiosk frontend."""
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/api/health")
+async def health(request: Request):
+    """Server health and configuration summary."""
+    return {
+        "status": "ok",
+        "detector": args.detector,
+        "embedder": args.embedder,
+        "anti_spoof": args.anti_spoof,
+        "employee_count": len(request.app.state.known_labels),
+        "unique_employees": len(set(request.app.state.known_labels)),
+        "threshold": request.app.state.threshold,
+        "cooldown_seconds": request.app.state.cooldown_seconds,
+        "consensus_required": request.app.state.consensus_required,
+    }
+
+
+@app.get("/api/attendance")
+async def get_attendance(request: Request, date: Optional[str] = None):
+    """Get attendance records for a date (default: today)."""
+    if date is None:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    records = get_attendance_by_date(request.app.state.db_conn, date)
+    return {"date": date, "records": records, "count": len(records)}
+
+
+@app.post("/api/recognize")
+async def recognize(request: Request, body: RecognizeRequest):
+    """Core recognition pipeline — decode, detect, anti-spoof, embed, match, log."""
+    state = request.app.state
+    camera_id = body.camera_id or state.camera_id
+    state.liveness.cleanup_stale()
+
+    # ── Step 1: Decode base64 → BGR → RGB ──
+    try:
+        image_data = body.image
+        # Strip data URI prefix if present
+        if "," in image_data and image_data.index(",") < 100:
+            image_data = image_data.split(",", 1)[1]
+        raw_bytes = base64.b64decode(image_data)
+        np_arr = np.frombuffer(raw_bytes, np.uint8)
+        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            return RecognizeResponse(status="error", message="Failed to decode image")
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        return RecognizeResponse(status="error", message=f"Image decode failed: {e}")
+
+    # ── Step 2: Detect faces ──
+    detections = state.detector.detect(frame_rgb)
+
+    # ── Step 3: Reject 0 or >1 faces ──
+    if len(detections) == 0:
+        return RecognizeResponse(status="no_face", message="No face detected")
+    if len(detections) > 1:
+        return RecognizeResponse(
+            status="multiple_faces",
+            message="Multiple faces detected. Please ensure only one person is at the kiosk.",
+        )
+
+    (x, y, w, h), landmarks = detections[0]
+
+    # ── Step 4: Anti-spoof check ──
+    if state.anti_spoof is not None:
+        face_crop = frame_rgb[y:y+h, x:x+w]
+        if face_crop.size > 0:
+            is_real, spoof_score = state.anti_spoof.check(face_crop)
+            print(f"[ANTI-SPOOF] is_real={is_real}, score={spoof_score:.4f}")
+            if not is_real:
+                # Reset any pending consensus for all identities
+                state.pending.clear()
+                log_spoof_attempt(state.db_conn, camera_id, spoof_score)
+                return RecognizeResponse(
+                    status="spoof_detected",
+                    message="Liveness check failed.",
+                )
+
+    # ── Step 5: Align face ──
+    if state.do_align and landmarks is not None:
+        aligned = align_face(frame_rgb, landmarks, 112)
+        aligned = np.ascontiguousarray(aligned)
+    else:
+        face_roi = frame_rgb[y:y+h, x:x+w]
+        aligned = np.ascontiguousarray(face_roi) if face_roi.size > 0 else None
+
+    if aligned is None:
+        return RecognizeResponse(status="error", message="Face alignment failed")
+
+    # ── Step 6: Embed ──
+    embedding = state.embedder.embed(aligned)
+    if embedding is None:
+        return RecognizeResponse(status="error", message="Embedding extraction failed")
+
+    # ── Step 7: Match ──
+    label, distance, confidence = find_best_match(
+        embedding, state.known_encodings, state.known_labels, state.threshold
+    )
+    if label == "Unknown":
+        state.pending.clear()
+        return RecognizeResponse(
+            status="unknown",
+            distance=round(distance, 4),
+            message="Face not recognized.",
+        )
+
+    # ── Step 8: Cooldown check ──
+    now = time.time()
+    last_seen = state.cooldown.get(label, 0)
+    if now - last_seen < state.cooldown_seconds:
+        remaining = int(state.cooldown_seconds - (now - last_seen))
+        return RecognizeResponse(
+            status="cooldown",
+            identity=label,
+            distance=round(distance, 4),
+            message=f"Already recorded. Please wait {remaining}s.",
+        )
+
+    # ── Step 9: Check for active liveness challenge first ──
+    # If a challenge is already in progress for this identity, skip consensus
+    # and go straight to liveness processing.
+    active_session = state.liveness.get_session(label)
+    if active_session is not None:
+        liveness_state, info = state.liveness.process_frame(
+            label, landmarks, frame_rgb, distance
+        )
+
+        if liveness_state == SessionState.CHALLENGE_ACTIVE:
+            challenge_instructions = {
+                "blink": "Please BLINK",
+                "nod": "Please NOD slowly",
+            }
+            ctype = info["challenge_type"]
+            return RecognizeResponse(
+                status="liveness_challenge",
+                identity=label,
+                distance=round(distance, 4),
+                challenge_type=ctype,
+                challenge_instruction=challenge_instructions[ctype],
+                challenge_time_remaining=info["time_remaining"],
+                message=challenge_instructions[ctype],
+            )
+
+        if liveness_state == SessionState.FAILED:
+            log_spoof_attempt(state.db_conn, camera_id, 0.0)
+            return RecognizeResponse(
+                status="spoof_detected",
+                message="Liveness challenge failed.",
+            )
+
+        # SessionState.VERIFIED — proceed to clock-in/out
+        avg_distance = info["avg_distance"]
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        last_record = get_last_attendance(state.db_conn, label, today_str)
+        is_clock_in = last_record is None or not last_record["is_clock_in"]
+        log_attendance(state.db_conn, label, avg_distance, is_clock_in, camera_id)
+        state.cooldown[label] = now
+        action = "Clocked In" if is_clock_in else "Clocked Out"
+        print(f"[ATTENDANCE] {label} — {action} (avg_dist={avg_distance:.4f})")
+        return RecognizeResponse(
+            status="recognized",
+            identity=label,
+            distance=round(avg_distance, 4),
+            is_clock_in=is_clock_in,
+            message=f"{action}: {label}",
+        )
+
+    # ── Step 10: Identity consensus (confirm same person across N frames) ──
+    consensus_required = state.consensus_required
+    pending = state.pending.get(label)
+
+    if pending is None or now - pending["last_time"] > 10.0:
+        state.pending.clear()
+        state.pending[label] = {"count": 1, "last_time": now, "distances": [distance]}
+    else:
+        pending["count"] += 1
+        pending["last_time"] = now
+        pending["distances"].append(distance)
+
+    current_count = state.pending[label]["count"]
+    print(f"[CONSENSUS] {label}: {current_count}/{consensus_required} "
+          f"(dist={distance:.4f})")
+
+    if current_count < consensus_required:
+        return RecognizeResponse(
+            status="verifying",
+            identity=label,
+            distance=round(distance, 4),
+            consensus_progress=current_count,
+            consensus_required=consensus_required,
+            message=f"Verifying... ({current_count}/{consensus_required})",
+        )
+
+    # Consensus reached — clear pending, start liveness challenge
+    state.pending.clear()
+
+    # ── Step 11: Start liveness challenge ──
+    session = state.liveness.start_session(label, landmarks, frame_rgb, distance)
+    challenge_instructions = {
+        "blink": "Please BLINK",
+        "nod": "Please NOD slowly",
+    }
+    return RecognizeResponse(
+        status="liveness_challenge",
+        identity=label,
+        distance=round(distance, 4),
+        challenge_type=session.challenge_type.value,
+        challenge_instruction=challenge_instructions[session.challenge_type.value],
+        challenge_time_remaining=session.timeout,
+        message=challenge_instructions[session.challenge_type.value],
+    )
+
+
+# ── K3 stubs (enrollment — implemented in Phase K3) ──
+# POST /api/enroll — add new employee
+# DELETE /api/enroll/{employee_id} — soft-delete employee
+# GET /api/employees — list active employees
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=args.host, port=args.port)

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kiosk — Clock In/Out</title>
+  <link rel="stylesheet" href="/static/kiosk.css">
+</head>
+<body>
+  <div class="kiosk-container">
+    <header class="kiosk-header">
+      <h1>Employee Clock-In</h1>
+      <div id="clock" class="clock"></div>
+    </header>
+
+    <div class="camera-section">
+      <video id="camera" autoplay playsinline muted></video>
+      <canvas id="snapshot" style="display:none;"></canvas>
+      <div id="camera-overlay" class="camera-overlay">
+        <div class="face-guide"></div>
+        <div id="challenge-prompt" class="challenge-prompt hidden"></div>
+        <div id="scan-status" class="scan-status">Position your face in the frame</div>
+      </div>
+    </div>
+
+    <div id="result-card" class="result-card hidden">
+      <div id="result-icon" class="result-icon"></div>
+      <div id="result-name" class="result-name"></div>
+      <div id="result-action" class="result-action"></div>
+      <div id="result-time" class="result-time"></div>
+    </div>
+
+    <div id="status-bar" class="status-bar">
+      <span id="status-dot" class="status-dot dot-idle"></span>
+      <span id="status-text">Initializing camera...</span>
+    </div>
+  </div>
+
+  <script src="/static/kiosk.js"></script>
+</body>
+</html>

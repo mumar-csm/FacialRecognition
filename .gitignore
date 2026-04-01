@@ -31,6 +31,9 @@ data/*.pkl
 # Haar Cascade model (large file, available from OpenCV)
 data/haarcascade_frontalface_default.xml
 
+# ONNX models (binary, downloaded at setup)
+models/
+
 # Debug/test scripts (temporary troubleshooting files)
 debug_image.py
 test_script.py
@@ -81,3 +84,14 @@ data/detections.db
 
 #--- Multi-camera test files ---
 cameras_test_multi.json
+
+#--- Kiosk runtime DB ---
+data/kiosk.db
+data/kiosk.db-wal
+data/kiosk.db-shm
+
+#--- Internal planning docs ---
+roadmap.md
+
+#--- Tests ---
+tests/
