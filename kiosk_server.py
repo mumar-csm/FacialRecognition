@@ -13,6 +13,8 @@ Usage:
 
 import argparse
 import base64
+import csv
+import io
 import os
 import pickle
 import re
@@ -26,8 +28,8 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -152,6 +154,69 @@ def get_attendance_by_date(conn: sqlite3.Connection, date: str) -> List[Dict]:
     ]
 
 
+def get_report_records(
+    conn: sqlite3.Connection,
+    start_bound: str,
+    end_bound: str,
+    employee: Optional[str] = None,
+) -> List[Dict]:
+    """Attendance records for a date range, joined with employee names."""
+    sql = (
+        "SELECT a.id, a.timestamp, a.employee_id, "
+        "COALESCE(e.name, a.employee_id) AS employee_name, "
+        "a.distance, a.is_clock_in, a.camera_id "
+        "FROM attendance a "
+        "LEFT JOIN employees e ON e.id = a.employee_id "
+        "WHERE a.timestamp >= ? AND a.timestamp <= ? "
+    )
+    params: list = [start_bound, end_bound]
+    if employee:
+        sql += "AND a.employee_id = ? "
+        params.append(employee)
+    sql += "ORDER BY a.timestamp ASC"
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "id": r[0], "timestamp": r[1], "employee_id": r[2],
+            "employee_name": r[3], "distance": r[4],
+            "is_clock_in": bool(r[5]), "camera_id": r[6],
+        }
+        for r in rows
+    ]
+
+
+def get_spoof_count_for_range(
+    conn: sqlite3.Connection, start_bound: str, end_bound: str
+) -> int:
+    """Count spoof attempts in a date range."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM spoof_attempts WHERE timestamp >= ? AND timestamp <= ?",
+        (start_bound, end_bound),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def deactivate_employee(conn: sqlite3.Connection, employee_id: str) -> bool:
+    """Soft-delete employee (is_active=0). Returns True if row was found and updated."""
+    cursor = conn.execute(
+        "UPDATE employees SET is_active = 0 WHERE id = ? AND is_active = 1",
+        (employee_id,),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_active_employees(conn: sqlite3.Connection) -> List[Dict]:
+    """Return all active enrolled employees."""
+    rows = conn.execute(
+        "SELECT id, name, enrolled_at, photo_path FROM employees WHERE is_active = 1 ORDER BY name"
+    ).fetchall()
+    return [
+        {"id": r[0], "name": r[1], "enrolled_at": r[2], "photo_path": r[3]}
+        for r in rows
+    ]
+
+
 def purge_old_records(conn: sqlite3.Connection,
                       attendance_days: int = 365,
                       spoof_days: int = 90) -> Tuple[int, int]:
@@ -168,6 +233,26 @@ def purge_old_records(conn: sqlite3.Connection,
 # ═══════════════════════════════════════════════════════════════════════
 # Enrollment persistence
 # ═══════════════════════════════════════════════════════════════════════
+
+def remove_encoding_from_pkl(db_path: str, label: str) -> None:
+    """Remove all entries for a label from the pkl file (atomic write)."""
+    with open(db_path, "rb") as f:
+        db = pickle.load(f)
+    # Filter all three parallel lists together
+    filtered = [
+        (enc, lbl, meta)
+        for enc, lbl, meta in zip(db.encodings, db.labels, db.meta)
+        if lbl != label
+    ]
+    if filtered:
+        db.encodings, db.labels, db.meta = map(list, zip(*filtered))
+    else:
+        db.encodings, db.labels, db.meta = [], [], []
+    tmp_path = db_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(db, f)
+    os.replace(tmp_path, db_path)
+
 
 def save_encoding_to_pkl(db_path: str, embedding: np.ndarray, label: str) -> None:
     """Append one encoding to the pkl file on disk using atomic write."""
@@ -196,7 +281,7 @@ def parse_args():
     p.add_argument("--embedder", choices=["dlib", "arcface"], default="arcface")
     p.add_argument("--anti-spoof", choices=["none", "minifas"], default="minifas",
                    dest="anti_spoof")
-    p.add_argument("--threshold", type=float, default=1.0,
+    p.add_argument("--threshold", type=float, default=0.6,
                    help="Distance threshold for face match")
     p.add_argument("--cooldown", type=int, default=120,
                    help="Cooldown between duplicate clock events (seconds)")
@@ -339,6 +424,12 @@ async def serve_enroll():
     return FileResponse(str(STATIC_DIR / "enroll.html"))
 
 
+@app.get("/report")
+async def serve_report():
+    """Serve the manager report page."""
+    return FileResponse(str(STATIC_DIR / "report.html"))
+
+
 @app.get("/api/health")
 async def health(request: Request):
     """Server health and configuration summary."""
@@ -362,6 +453,92 @@ async def get_attendance(request: Request, date: Optional[str] = None):
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     records = get_attendance_by_date(request.app.state.db_conn, date)
     return {"date": date, "records": records, "count": len(records)}
+
+
+@app.get("/api/report")
+async def get_report(
+    request: Request,
+    start: Optional[str] = Query(default=None, description="Start date YYYY-MM-DD"),
+    end: Optional[str] = Query(default=None, description="End date YYYY-MM-DD"),
+    employee: Optional[str] = Query(default=None, description="Filter by employee_id"),
+):
+    """Attendance report for a date range, with summary stats."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if end is None:
+        end = today
+    if start is None:
+        start = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    date_re = r"^\d{4}-\d{2}-\d{2}$"
+    if not re.fullmatch(date_re, start) or not re.fullmatch(date_re, end):
+        return JSONResponse({"error": "Invalid date format. Use YYYY-MM-DD."}, status_code=400)
+
+    start_bound = start + "T00:00:00"
+    end_bound = end + "T23:59:59"
+    conn = request.app.state.db_conn
+
+    records = get_report_records(conn, start_bound, end_bound, employee or None)
+    spoof_count = get_spoof_count_for_range(conn, start_bound, end_bound)
+
+    return {
+        "start": start,
+        "end": end,
+        "employee_filter": employee or None,
+        "records": records,
+        "count": len(records),
+        "summary": {
+            "total_clock_ins": sum(1 for r in records if r["is_clock_in"]),
+            "total_clock_outs": sum(1 for r in records if not r["is_clock_in"]),
+            "unique_employees": len(set(r["employee_id"] for r in records)),
+            "spoof_attempts_count": spoof_count,
+        },
+    }
+
+
+@app.get("/api/report/csv")
+async def get_report_csv(
+    request: Request,
+    start: Optional[str] = Query(default=None),
+    end: Optional[str] = Query(default=None),
+    employee: Optional[str] = Query(default=None),
+):
+    """Download attendance report as CSV."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if end is None:
+        end = today
+    if start is None:
+        start = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    date_re = r"^\d{4}-\d{2}-\d{2}$"
+    if not re.fullmatch(date_re, start) or not re.fullmatch(date_re, end):
+        return JSONResponse({"error": "Invalid date format."}, status_code=400)
+
+    records = get_report_records(
+        request.app.state.db_conn,
+        start + "T00:00:00",
+        end + "T23:59:59",
+        employee or None,
+    )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "Time (UTC)", "Employee ID", "Employee Name",
+                     "Event Type", "Confidence", "Camera"])
+    for r in records:
+        ts = r["timestamp"]
+        confidence = f"{max(0.0, (1.0 - r['distance']) * 100):.2f}%"
+        writer.writerow([
+            ts[:10], ts[11:19], r["employee_id"], r["employee_name"],
+            "Clock In" if r["is_clock_in"] else "Clock Out",
+            confidence, r["camera_id"],
+        ])
+
+    filename = f"attendance_{start}_{end}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 @app.post("/api/recognize")
@@ -646,8 +823,10 @@ async def enroll(request: Request, body: EnrollRequest):
     # ── Insert into employees table ──
     ts = datetime.now(timezone.utc).isoformat()
     state.db_conn.execute(
-        "INSERT OR IGNORE INTO employees (id, name, enrolled_at, photo_path, is_active) "
-        "VALUES (?, ?, ?, ?, 1)",
+        "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active) "
+        "VALUES (?, ?, ?, ?, 1) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "is_active = 1, enrolled_at = excluded.enrolled_at, photo_path = excluded.photo_path",
         (employee_name, f"{first} {last}", ts, str(photo_file)),
     )
     state.db_conn.commit()
@@ -658,6 +837,62 @@ async def enroll(request: Request, body: EnrollRequest):
         message=f"{employee_name} enrolled successfully!",
         employee_name=employee_name,
     )
+
+
+@app.delete("/api/enroll/{employee_id}")
+async def delete_employee(request: Request, employee_id: str):
+    """Remove an employee from recognition and mark as inactive."""
+    state = request.app.state
+
+    # ── Check exists and is active ──
+    row = state.db_conn.execute(
+        "SELECT photo_path FROM employees WHERE id = ? AND is_active = 1",
+        (employee_id,),
+    ).fetchone()
+    if row is None:
+        return {"status": "not_found", "message": f"No active employee found with id '{employee_id}'.", "employee_id": employee_id}
+
+    photo_path = row[0]
+
+    # ── Remove from pkl (before in-memory — safer ordering) ──
+    try:
+        remove_encoding_from_pkl(args.database, employee_id)
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to update encoding database: {e}", "employee_id": employee_id}
+
+    # ── Hot-reload in-memory: filter both parallel lists ──
+    pairs = [(enc, lbl) for enc, lbl in zip(state.known_encodings, state.known_labels) if lbl != employee_id]
+    if pairs:
+        state.known_encodings, state.known_labels = map(list, zip(*pairs))
+    else:
+        state.known_encodings, state.known_labels = [], []
+
+    # ── Soft-delete in SQLite ──
+    deactivate_employee(state.db_conn, employee_id)
+
+    # ── Delete photo file ──
+    if photo_path:
+        try:
+            Path(photo_path).unlink(missing_ok=True)
+        except Exception:
+            pass  # Non-fatal — record is already deactivated
+
+    # ── Clear in-memory state for this identity ──
+    state.cooldown.pop(employee_id, None)
+    state.pending.pop(employee_id, None)
+
+    print(f"[DELETE] {employee_id} removed")
+    return {"status": "deleted", "message": f"{employee_id} removed successfully.", "employee_id": employee_id}
+
+
+@app.get("/api/employees")
+async def list_employees(request: Request):
+    """Return all active enrolled employees."""
+    employees = get_active_employees(request.app.state.db_conn)
+    for emp in employees:
+        photo_path = emp.pop("photo_path")
+        emp["has_photo"] = bool(photo_path and Path(photo_path).exists())
+    return {"employees": employees, "count": len(employees)}
 
 
 # ═══════════════════════════════════════════════════════════════════════

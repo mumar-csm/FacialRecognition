@@ -213,3 +213,7 @@ body {
   0%, 100% { opacity: 1; transform: translateX(-50%) scale(1); }
   50% { opacity: 0.85; transform: translateX(-50%) scale(1.03); }
 }
+
+/* Manager nav link (used in status bar) */
+.back-link { color: #94a3b8; text-decoration: none; font-size: 14px; }
+.back-link:hover { color: #e2e8f0; }
