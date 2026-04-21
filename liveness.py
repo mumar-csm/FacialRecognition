@@ -122,7 +122,7 @@ class LivenessManager:
     def __init__(
         self,
         challenge_timeout: float = 8.0,
-        blink_threshold: float = 0.78,
+        blink_threshold: float = 0.85,
         nod_threshold: float = 0.15,
     ):
         self.sessions: Dict[str, LivenessSession] = {}
@@ -238,6 +238,13 @@ class LivenessManager:
         if session.baseline_eye_metric < 1.0:
             return False  # bad baseline
 
+        # Rolling max baseline: the initial calibration frame can catch the user
+        # mid-blink or with unusually wide eyes, either of which makes real blinks
+        # impossible to measure. Growing the baseline to the max observed metric
+        # pins it to the true "eyes open" state before any blink happens.
+        if not session.blink_detected and current_metric > session.baseline_eye_metric:
+            session.baseline_eye_metric = current_metric
+
         ratio = current_metric / session.baseline_eye_metric
 
         # Detect the dip (eyes closing)
@@ -245,7 +252,7 @@ class LivenessManager:
             session.blink_detected = True
 
         # Blink complete: we saw a dip and now eyes are open again
-        if session.blink_detected and ratio > 0.75:
+        if session.blink_detected and ratio > 0.90:
             return True
 
         return False

@@ -350,6 +350,9 @@ async def lifespan(app: FastAPI):
     # Consensus tracker for identity confirmation (pre-challenge)
     app.state.pending: Dict[str, Dict] = {}
 
+    # Consecutive spoof-positive frame counter (debounce borderline scores)
+    app.state.spoof_streak: int = 0
+
     # Liveness challenge manager
     app.state.liveness = LivenessManager(challenge_timeout=args.challenge_timeout)
 
@@ -577,20 +580,92 @@ async def recognize(request: Request, body: RecognizeRequest):
 
     (x, y, w, h), landmarks = detections[0]
 
+    # ── Step 3.5: Fast-path during active liveness challenge ──
+    # Identity is already confirmed; all we need are the landmarks for the blink
+    # check. Skipping anti-spoof + align + embed + match cuts per-frame cost by
+    # ~60-70%, which is what makes short blinks catchable (fewer missed samples).
+    active_identity = next(iter(state.liveness.sessions), None)
+    if active_identity is not None:
+        # Use the session's most recent distance as a placeholder for logging
+        prior_distances = state.liveness.sessions[active_identity].distances
+        placeholder_dist = prior_distances[-1] if prior_distances else 0.0
+        liveness_state, info = state.liveness.process_frame(
+            active_identity, landmarks, frame_rgb, placeholder_dist
+        )
+
+        if liveness_state == SessionState.CHALLENGE_ACTIVE:
+            return RecognizeResponse(
+                status="liveness_challenge",
+                identity=active_identity,
+                distance=round(placeholder_dist, 4),
+                challenge_type=info["challenge_type"],
+                challenge_instruction="Please BLINK",
+                challenge_time_remaining=info["time_remaining"],
+                message="Please BLINK",
+            )
+
+        if liveness_state == SessionState.FAILED:
+            log_spoof_attempt(state.db_conn, camera_id, 0.0)
+            return RecognizeResponse(
+                status="spoof_detected",
+                message="Liveness challenge failed.",
+            )
+
+        # VERIFIED — proceed to clock-in/out
+        avg_distance = info["avg_distance"]
+        now = time.time()
+        last_seen = state.cooldown.get(active_identity, 0)
+        if now - last_seen < state.cooldown_seconds:
+            remaining = int(state.cooldown_seconds - (now - last_seen))
+            return RecognizeResponse(
+                status="cooldown",
+                identity=active_identity,
+                distance=round(avg_distance, 4),
+                message=f"Already recorded. Please wait {remaining}s.",
+            )
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        last_record = get_last_attendance(state.db_conn, active_identity, today_str)
+        is_clock_in = last_record is None or not last_record["is_clock_in"]
+        log_attendance(state.db_conn, active_identity, avg_distance, is_clock_in, camera_id)
+        state.cooldown[active_identity] = now
+        action = "Clocked In" if is_clock_in else "Clocked Out"
+        print(f"[ATTENDANCE] {active_identity} — {action} (avg_dist={avg_distance:.4f})")
+        return RecognizeResponse(
+            status="recognized",
+            identity=active_identity,
+            distance=round(avg_distance, 4),
+            is_clock_in=is_clock_in,
+            message=f"{action}: {active_identity}",
+        )
+
     # ── Step 4: Anti-spoof check ──
-    if state.anti_spoof is not None:
+    # Skip during an active liveness challenge — mid-blink frames score low on
+    # MiniFAS (eyes partially closed), which would abort the challenge incorrectly.
+    if state.anti_spoof is not None and not state.liveness.sessions:
         face_crop = frame_rgb[y:y+h, x:x+w]
         if face_crop.size > 0:
             is_real, spoof_score = state.anti_spoof.check(face_crop)
             print(f"[ANTI-SPOOF] is_real={is_real}, score={spoof_score:.4f}")
             if not is_real:
-                # Reset any pending consensus for all identities
-                state.pending.clear()
-                log_spoof_attempt(state.db_conn, camera_id, spoof_score)
+                # Debounce: a single borderline dip shouldn't kill consensus.
+                # Require 2 consecutive spoof-positive frames before aborting —
+                # real attacks score low consistently, real faces only flicker.
+                state.spoof_streak += 1
+                if state.spoof_streak >= 2:
+                    state.pending.clear()
+                    state.spoof_streak = 0
+                    log_spoof_attempt(state.db_conn, camera_id, spoof_score)
+                    return RecognizeResponse(
+                        status="spoof_detected",
+                        message="Liveness check failed.",
+                    )
+                # First dip — skip this frame, keep consensus intact
                 return RecognizeResponse(
-                    status="spoof_detected",
-                    message="Liveness check failed.",
+                    status="no_face",
+                    message="Hold still.",
                 )
+            else:
+                state.spoof_streak = 0
 
     # ── Step 5: Align face ──
     if state.do_align and landmarks is not None:
@@ -632,56 +707,7 @@ async def recognize(request: Request, body: RecognizeRequest):
             message=f"Already recorded. Please wait {remaining}s.",
         )
 
-    # ── Step 9: Check for active liveness challenge first ──
-    # If a challenge is already in progress for this identity, skip consensus
-    # and go straight to liveness processing.
-    active_session = state.liveness.get_session(label)
-    if active_session is not None:
-        liveness_state, info = state.liveness.process_frame(
-            label, landmarks, frame_rgb, distance
-        )
-
-        if liveness_state == SessionState.CHALLENGE_ACTIVE:
-            challenge_instructions = {
-                "blink": "Please BLINK",
-                "nod": "Please NOD slowly",
-            }
-            ctype = info["challenge_type"]
-            return RecognizeResponse(
-                status="liveness_challenge",
-                identity=label,
-                distance=round(distance, 4),
-                challenge_type=ctype,
-                challenge_instruction=challenge_instructions[ctype],
-                challenge_time_remaining=info["time_remaining"],
-                message=challenge_instructions[ctype],
-            )
-
-        if liveness_state == SessionState.FAILED:
-            log_spoof_attempt(state.db_conn, camera_id, 0.0)
-            return RecognizeResponse(
-                status="spoof_detected",
-                message="Liveness challenge failed.",
-            )
-
-        # SessionState.VERIFIED — proceed to clock-in/out
-        avg_distance = info["avg_distance"]
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        last_record = get_last_attendance(state.db_conn, label, today_str)
-        is_clock_in = last_record is None or not last_record["is_clock_in"]
-        log_attendance(state.db_conn, label, avg_distance, is_clock_in, camera_id)
-        state.cooldown[label] = now
-        action = "Clocked In" if is_clock_in else "Clocked Out"
-        print(f"[ATTENDANCE] {label} — {action} (avg_dist={avg_distance:.4f})")
-        return RecognizeResponse(
-            status="recognized",
-            identity=label,
-            distance=round(avg_distance, 4),
-            is_clock_in=is_clock_in,
-            message=f"{action}: {label}",
-        )
-
-    # ── Step 10: Identity consensus (confirm same person across N frames) ──
+    # ── Step 9: Identity consensus (confirm same person across N frames) ──
     consensus_required = state.consensus_required
     pending = state.pending.get(label)
 
