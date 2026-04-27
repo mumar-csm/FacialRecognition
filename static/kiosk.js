@@ -19,13 +19,15 @@
   // ── State ──
   const CAPTURE_INTERVAL_MS = 2000;
   const VERIFY_INTERVAL_MS = 800;   // Faster capture during verification
-  const CHALLENGE_INTERVAL_MS = 500; // Fast capture during liveness challenge
+  const CHALLENGE_INTERVAL_MS = 200; // Fast capture during liveness challenge
   const RESULT_DISPLAY_MS = 4000;
+  const RECOGNIZED_LOCKOUT_MS = 2000; // suppress stale responses after a success
   let capturing = false;
   let paused = false;
   let captureTimer = null;
   let verifying = false;
   let challenging = false;
+  let recognizedAt = 0;
 
   // ── Clock ──
   function updateClock() {
@@ -120,8 +122,18 @@
 
   // ── Handle recognition result ──
   function handleResult(data) {
+    // pauseCapture() stops new captures but in-flight fetches still arrive.
+    // After a successful recognition the server engages the cooldown, so
+    // those stale responses come back as "cooldown" and would overwrite the
+    // success card. Suppress non-success statuses briefly to let the success
+    // card stay visible.
+    if (data.status !== "recognized" && Date.now() - recognizedAt < RECOGNIZED_LOCKOUT_MS) {
+      return;
+    }
+
     switch (data.status) {
       case "recognized":
+        recognizedAt = Date.now();
         setCaptureSpeed("normal");
         showResult({
           icon: data.is_clock_in ? "\u2713" : "\u2190",

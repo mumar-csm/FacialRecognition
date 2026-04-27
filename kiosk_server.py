@@ -287,9 +287,9 @@ def parse_args():
                    help="Cooldown between duplicate clock events (seconds)")
     p.add_argument("--consensus", type=int, default=3,
                    help="Consecutive frames required to confirm identity before liveness challenge (default: 3)")
-    p.add_argument("--spoof-threshold", type=float, default=0.75,
+    p.add_argument("--spoof-threshold", type=float, default=0.55,
                    dest="spoof_threshold",
-                   help="Anti-spoof probability threshold (0-1, higher=stricter, default: 0.75)")
+                   help="Anti-spoof probability threshold (0-1, higher=stricter, default: 0.55)")
     p.add_argument("--challenge-timeout", type=float, default=8.0,
                    dest="challenge_timeout",
                    help="Seconds allowed for liveness challenge (default: 8.0)")
