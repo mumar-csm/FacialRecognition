@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Attendance Report</title>
+  <link rel="stylesheet" href="/static/report.css">
+</head>
+<body>
+  <div class="report-container">
+
+    <header class="report-header">
+      <h1>Attendance Report</h1>
+      <nav class="report-nav">
+        <a href="/">Clock-In</a>
+        <a href="/enroll">Enroll</a>
+      </nav>
+    </header>
+
+    <div class="filter-bar">
+      <label>From
+        <input type="date" id="start-date">
+      </label>
+      <label>To
+        <input type="date" id="end-date">
+      </label>
+      <label>Employee
+        <select id="employee-filter">
+          <option value="">All Employees</option>
+        </select>
+      </label>
+      <button id="load-btn">Load Report</button>
+      <button id="csv-btn" disabled>Export CSV</button>
+    </div>
+
+    <div class="summary-row" id="summary-row" style="display:none">
+      <div class="summary-card card-green">
+        <div class="card-value" id="sum-clockins">–</div>
+        <div class="card-label">Clock Ins</div>
+      </div>
+      <div class="summary-card card-blue">
+        <div class="card-value" id="sum-clockouts">–</div>
+        <div class="card-label">Clock Outs</div>
+      </div>
+      <div class="summary-card card-amber">
+        <div class="card-value" id="sum-employees">–</div>
+        <div class="card-label">Unique Employees</div>
+      </div>
+      <div class="summary-card card-red">
+        <div class="card-value" id="sum-spoof">–</div>
+        <div class="card-label">Spoof Attempts</div>
+      </div>
+    </div>
+
+    <div class="table-wrapper" id="table-wrapper" style="display:none">
+      <table class="report-table" id="report-table">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Time (UTC)</th>
+            <th>Employee</th>
+            <th>Type</th>
+            <th>Confidence</th>
+            <th>Camera</th>
+          </tr>
+        </thead>
+        <tbody id="report-tbody"></tbody>
+      </table>
+    </div>
+
+    <div id="empty-state" class="empty-state" style="display:none">
+      No records found for this date range.
+    </div>
+
+    <div id="status-bar" class="status-bar">
+      <span id="status-dot" class="status-dot dot-idle"></span>
+      <span id="status-text">Enter a date range and click Load Report</span>
+    </div>
+
+  </div>
+  <script src="/static/report.js"></script>
+</body>
+</html>

@@ -89,6 +89,8 @@ cameras_test_multi.json
 data/kiosk.db
 data/kiosk.db-wal
 data/kiosk.db-shm
+data/employees/*
+!data/employees/.gitkeep
 
 #--- Internal planning docs ---
 roadmap.md

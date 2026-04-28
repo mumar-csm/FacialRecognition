@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Enroll Employee</title>
+  <link rel="stylesheet" href="/static/kiosk.css">
+  <style>
+    .enroll-form {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      width: 480px;
+      max-width: 90vw;
+    }
+
+    .enroll-row {
+      display: flex;
+      gap: 12px;
+    }
+
+    .enroll-input {
+      flex: 1;
+      padding: 14px 16px;
+      font-size: 18px;
+      border: 2px solid #334155;
+      border-radius: 10px;
+      background: #1e293b;
+      color: #e2e8f0;
+      outline: none;
+    }
+
+    .enroll-input:focus {
+      border-color: #3b82f6;
+    }
+
+    .enroll-input::placeholder {
+      color: #64748b;
+    }
+
+    .enroll-btn {
+      padding: 16px;
+      font-size: 20px;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      background: #3b82f6;
+      color: #fff;
+      cursor: pointer;
+      min-height: 56px;
+    }
+
+    .enroll-btn:hover {
+      background: #2563eb;
+    }
+
+    .enroll-btn:disabled {
+      background: #334155;
+      color: #64748b;
+      cursor: not-allowed;
+    }
+
+    .lighting-warning {
+      position: absolute;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 15px;
+      font-weight: 600;
+      color: #fbbf24;
+      background: rgba(15, 23, 42, 0.85);
+      padding: 8px 20px;
+      border-radius: 10px;
+      border: 2px solid #f59e0b;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    .lighting-warning.hidden {
+      display: none;
+    }
+
+    .back-link {
+      color: #94a3b8;
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    .back-link:hover {
+      color: #e2e8f0;
+    }
+
+    .name-hint {
+      font-size: 13px;
+      color: #f59e0b;
+      text-align: center;
+    }
+
+    .name-hint.hidden {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="kiosk-container">
+    <header class="kiosk-header">
+      <h1>Enroll New Employee</h1>
+    </header>
+
+    <div class="camera-section">
+      <video id="camera" autoplay playsinline muted></video>
+      <canvas id="snapshot" style="display:none;"></canvas>
+      <div class="camera-overlay">
+        <div class="face-guide"></div>
+        <div id="lighting-warning" class="lighting-warning hidden"></div>
+      </div>
+    </div>
+
+    <div class="enroll-form">
+      <div class="enroll-row">
+        <input type="text" id="first-name" placeholder="First Name" class="enroll-input" autocomplete="off" />
+        <input type="text" id="last-name" placeholder="Last Name" class="enroll-input" autocomplete="off" />
+      </div>
+      <div id="name-hint" class="name-hint hidden"></div>
+      <button id="enroll-btn" class="enroll-btn" disabled>Capture &amp; Enroll</button>
+    </div>
+
+    <div id="result-card" class="result-card hidden">
+      <div id="result-icon" class="result-icon"></div>
+      <div id="result-name" class="result-name"></div>
+      <div id="result-action" class="result-action"></div>
+    </div>
+
+    <div class="status-bar">
+      <span id="status-dot" class="status-dot dot-idle"></span>
+      <span id="status-text">Initializing camera...</span>
+      <span style="margin-left: auto; display: flex; gap: 16px;">
+        <a href="/" class="back-link">&#8592; Back to Clock-In</a>
+        <a href="/report" class="back-link">Reports &#8594;</a>
+      </span>
+    </div>
+  </div>
+
+  <script src="/static/enroll.js"></script>
+</body>
+</html>

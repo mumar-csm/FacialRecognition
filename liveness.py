@@ -122,7 +122,7 @@ class LivenessManager:
     def __init__(
         self,
         challenge_timeout: float = 8.0,
-        blink_threshold: float = 0.78,
+        blink_threshold: float = 0.85,
         nod_threshold: float = 0.15,
     ):
         self.sessions: Dict[str, LivenessSession] = {}
@@ -238,15 +238,32 @@ class LivenessManager:
         if session.baseline_eye_metric < 1.0:
             return False  # bad baseline
 
+        # Rolling max baseline: the initial calibration frame can catch the user
+        # mid-blink, which would make every subsequent ratio >1.0 and no blink
+        # ever detectable. Growing the baseline to the max observed metric
+        # corrects that by pinning it to the most-open state seen so far. Note
+        # this rule prefers high values, so a transient wide-eye moment
+        # (anticipation, surprise, detector quirk) can lock in an outlier
+        # ceiling that natural post-blink eyes can't reach. The recovery gate
+        # below compensates for that case using a dip-relative target.
+        if not session.blink_detected and current_metric > session.baseline_eye_metric:
+            session.baseline_eye_metric = current_metric
+
         ratio = current_metric / session.baseline_eye_metric
 
         # Detect the dip (eyes closing)
         if ratio < self.blink_threshold:
             session.blink_detected = True
 
-        # Blink complete: we saw a dip and now eyes are open again
-        if session.blink_detected and ratio > 0.75:
-            return True
+        # Blink complete: rise must close >=30% of the gap between the dip and
+        # full open. Scales with dip depth — clear blinks get a forgiving bar,
+        # shallow scrape-of-the-line dips face a stricter one. The 30% is
+        # empirical from a small test set; revisit with pilot data.
+        if session.blink_detected:
+            min_ratio = min(session.eye_metrics) / session.baseline_eye_metric
+            recovery_target = min_ratio + (1.0 - min_ratio) * 0.30
+            if ratio > recovery_target:
+                return True
 
         return False
 

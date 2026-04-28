@@ -13,7 +13,11 @@ Usage:
 
 import argparse
 import base64
+import csv
+import io
 import os
+import pickle
+import re
 import sqlite3
 import sys
 import time
@@ -24,8 +28,8 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -150,6 +154,69 @@ def get_attendance_by_date(conn: sqlite3.Connection, date: str) -> List[Dict]:
     ]
 
 
+def get_report_records(
+    conn: sqlite3.Connection,
+    start_bound: str,
+    end_bound: str,
+    employee: Optional[str] = None,
+) -> List[Dict]:
+    """Attendance records for a date range, joined with employee names."""
+    sql = (
+        "SELECT a.id, a.timestamp, a.employee_id, "
+        "COALESCE(e.name, a.employee_id) AS employee_name, "
+        "a.distance, a.is_clock_in, a.camera_id "
+        "FROM attendance a "
+        "LEFT JOIN employees e ON e.id = a.employee_id "
+        "WHERE a.timestamp >= ? AND a.timestamp <= ? "
+    )
+    params: list = [start_bound, end_bound]
+    if employee:
+        sql += "AND a.employee_id = ? "
+        params.append(employee)
+    sql += "ORDER BY a.timestamp ASC"
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "id": r[0], "timestamp": r[1], "employee_id": r[2],
+            "employee_name": r[3], "distance": r[4],
+            "is_clock_in": bool(r[5]), "camera_id": r[6],
+        }
+        for r in rows
+    ]
+
+
+def get_spoof_count_for_range(
+    conn: sqlite3.Connection, start_bound: str, end_bound: str
+) -> int:
+    """Count spoof attempts in a date range."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM spoof_attempts WHERE timestamp >= ? AND timestamp <= ?",
+        (start_bound, end_bound),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def deactivate_employee(conn: sqlite3.Connection, employee_id: str) -> bool:
+    """Soft-delete employee (is_active=0). Returns True if row was found and updated."""
+    cursor = conn.execute(
+        "UPDATE employees SET is_active = 0 WHERE id = ? AND is_active = 1",
+        (employee_id,),
+    )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def get_active_employees(conn: sqlite3.Connection) -> List[Dict]:
+    """Return all active enrolled employees."""
+    rows = conn.execute(
+        "SELECT id, name, enrolled_at, photo_path FROM employees WHERE is_active = 1 ORDER BY name"
+    ).fetchall()
+    return [
+        {"id": r[0], "name": r[1], "enrolled_at": r[2], "photo_path": r[3]}
+        for r in rows
+    ]
+
+
 def purge_old_records(conn: sqlite3.Connection,
                       attendance_days: int = 365,
                       spoof_days: int = 90) -> Tuple[int, int]:
@@ -161,6 +228,43 @@ def purge_old_records(conn: sqlite3.Connection,
     c2 = conn.execute("DELETE FROM spoof_attempts WHERE timestamp < ?", (spoof_cutoff,))
     conn.commit()
     return c1.rowcount, c2.rowcount
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Enrollment persistence
+# ═══════════════════════════════════════════════════════════════════════
+
+def remove_encoding_from_pkl(db_path: str, label: str) -> None:
+    """Remove all entries for a label from the pkl file (atomic write)."""
+    with open(db_path, "rb") as f:
+        db = pickle.load(f)
+    # Filter all three parallel lists together
+    filtered = [
+        (enc, lbl, meta)
+        for enc, lbl, meta in zip(db.encodings, db.labels, db.meta)
+        if lbl != label
+    ]
+    if filtered:
+        db.encodings, db.labels, db.meta = map(list, zip(*filtered))
+    else:
+        db.encodings, db.labels, db.meta = [], [], []
+    tmp_path = db_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(db, f)
+    os.replace(tmp_path, db_path)
+
+
+def save_encoding_to_pkl(db_path: str, embedding: np.ndarray, label: str) -> None:
+    """Append one encoding to the pkl file on disk using atomic write."""
+    with open(db_path, "rb") as f:
+        db = pickle.load(f)
+    db.encodings.append(embedding.tolist())
+    db.labels.append(label)
+    db.meta.append({"source": "kiosk_enrollment", "label": label})
+    tmp_path = db_path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(db, f)
+    os.replace(tmp_path, db_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -177,15 +281,15 @@ def parse_args():
     p.add_argument("--embedder", choices=["dlib", "arcface"], default="arcface")
     p.add_argument("--anti-spoof", choices=["none", "minifas"], default="minifas",
                    dest="anti_spoof")
-    p.add_argument("--threshold", type=float, default=1.0,
+    p.add_argument("--threshold", type=float, default=0.6,
                    help="Distance threshold for face match")
     p.add_argument("--cooldown", type=int, default=120,
                    help="Cooldown between duplicate clock events (seconds)")
     p.add_argument("--consensus", type=int, default=3,
                    help="Consecutive frames required to confirm identity before liveness challenge (default: 3)")
-    p.add_argument("--spoof-threshold", type=float, default=0.75,
+    p.add_argument("--spoof-threshold", type=float, default=0.55,
                    dest="spoof_threshold",
-                   help="Anti-spoof probability threshold (0-1, higher=stricter, default: 0.75)")
+                   help="Anti-spoof probability threshold (0-1, higher=stricter, default: 0.55)")
     p.add_argument("--challenge-timeout", type=float, default=8.0,
                    dest="challenge_timeout",
                    help="Seconds allowed for liveness challenge (default: 8.0)")
@@ -246,6 +350,9 @@ async def lifespan(app: FastAPI):
     # Consensus tracker for identity confirmation (pre-challenge)
     app.state.pending: Dict[str, Dict] = {}
 
+    # Consecutive spoof-positive frame counter (debounce borderline scores)
+    app.state.spoof_streak: int = 0
+
     # Liveness challenge manager
     app.state.liveness = LivenessManager(challenge_timeout=args.challenge_timeout)
 
@@ -273,6 +380,18 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # ═══════════════════════════════════════════════════════════════════════
 # Pydantic Models
 # ═══════════════════════════════════════════════════════════════════════
+
+class EnrollRequest(BaseModel):
+    image: str        # base64-encoded JPEG (with or without data URI prefix)
+    first_name: str
+    last_name: str
+
+
+class EnrollResponse(BaseModel):
+    status: str  # enrolled, already_exists, no_face, multiple_faces, spoof_detected, error
+    message: str = ""
+    employee_name: str = ""  # stored as firstname_lastname
+
 
 class RecognizeRequest(BaseModel):
     image: str  # base64-encoded JPEG (with or without data URI prefix)
@@ -302,6 +421,18 @@ async def serve_index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+@app.get("/enroll")
+async def serve_enroll():
+    """Serve the enrollment page."""
+    return FileResponse(str(STATIC_DIR / "enroll.html"))
+
+
+@app.get("/report")
+async def serve_report():
+    """Serve the manager report page."""
+    return FileResponse(str(STATIC_DIR / "report.html"))
+
+
 @app.get("/api/health")
 async def health(request: Request):
     """Server health and configuration summary."""
@@ -325,6 +456,92 @@ async def get_attendance(request: Request, date: Optional[str] = None):
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     records = get_attendance_by_date(request.app.state.db_conn, date)
     return {"date": date, "records": records, "count": len(records)}
+
+
+@app.get("/api/report")
+async def get_report(
+    request: Request,
+    start: Optional[str] = Query(default=None, description="Start date YYYY-MM-DD"),
+    end: Optional[str] = Query(default=None, description="End date YYYY-MM-DD"),
+    employee: Optional[str] = Query(default=None, description="Filter by employee_id"),
+):
+    """Attendance report for a date range, with summary stats."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if end is None:
+        end = today
+    if start is None:
+        start = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    date_re = r"^\d{4}-\d{2}-\d{2}$"
+    if not re.fullmatch(date_re, start) or not re.fullmatch(date_re, end):
+        return JSONResponse({"error": "Invalid date format. Use YYYY-MM-DD."}, status_code=400)
+
+    start_bound = start + "T00:00:00"
+    end_bound = end + "T23:59:59"
+    conn = request.app.state.db_conn
+
+    records = get_report_records(conn, start_bound, end_bound, employee or None)
+    spoof_count = get_spoof_count_for_range(conn, start_bound, end_bound)
+
+    return {
+        "start": start,
+        "end": end,
+        "employee_filter": employee or None,
+        "records": records,
+        "count": len(records),
+        "summary": {
+            "total_clock_ins": sum(1 for r in records if r["is_clock_in"]),
+            "total_clock_outs": sum(1 for r in records if not r["is_clock_in"]),
+            "unique_employees": len(set(r["employee_id"] for r in records)),
+            "spoof_attempts_count": spoof_count,
+        },
+    }
+
+
+@app.get("/api/report/csv")
+async def get_report_csv(
+    request: Request,
+    start: Optional[str] = Query(default=None),
+    end: Optional[str] = Query(default=None),
+    employee: Optional[str] = Query(default=None),
+):
+    """Download attendance report as CSV."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if end is None:
+        end = today
+    if start is None:
+        start = (datetime.now(timezone.utc) - timedelta(days=6)).strftime("%Y-%m-%d")
+
+    date_re = r"^\d{4}-\d{2}-\d{2}$"
+    if not re.fullmatch(date_re, start) or not re.fullmatch(date_re, end):
+        return JSONResponse({"error": "Invalid date format."}, status_code=400)
+
+    records = get_report_records(
+        request.app.state.db_conn,
+        start + "T00:00:00",
+        end + "T23:59:59",
+        employee or None,
+    )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "Time (UTC)", "Employee ID", "Employee Name",
+                     "Event Type", "Confidence", "Camera"])
+    for r in records:
+        ts = r["timestamp"]
+        confidence = f"{max(0.0, (1.0 - r['distance']) * 100):.2f}%"
+        writer.writerow([
+            ts[:10], ts[11:19], r["employee_id"], r["employee_name"],
+            "Clock In" if r["is_clock_in"] else "Clock Out",
+            confidence, r["camera_id"],
+        ])
+
+    filename = f"attendance_{start}_{end}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 @app.post("/api/recognize")
@@ -363,20 +580,92 @@ async def recognize(request: Request, body: RecognizeRequest):
 
     (x, y, w, h), landmarks = detections[0]
 
+    # ── Step 3.5: Fast-path during active liveness challenge ──
+    # Identity is already confirmed; all we need are the landmarks for the blink
+    # check. Skipping anti-spoof + align + embed + match cuts per-frame cost by
+    # ~60-70%, which is what makes short blinks catchable (fewer missed samples).
+    active_identity = next(iter(state.liveness.sessions), None)
+    if active_identity is not None:
+        # Use the session's most recent distance as a placeholder for logging
+        prior_distances = state.liveness.sessions[active_identity].distances
+        placeholder_dist = prior_distances[-1] if prior_distances else 0.0
+        liveness_state, info = state.liveness.process_frame(
+            active_identity, landmarks, frame_rgb, placeholder_dist
+        )
+
+        if liveness_state == SessionState.CHALLENGE_ACTIVE:
+            return RecognizeResponse(
+                status="liveness_challenge",
+                identity=active_identity,
+                distance=round(placeholder_dist, 4),
+                challenge_type=info["challenge_type"],
+                challenge_instruction="Please BLINK",
+                challenge_time_remaining=info["time_remaining"],
+                message="Please BLINK",
+            )
+
+        if liveness_state == SessionState.FAILED:
+            log_spoof_attempt(state.db_conn, camera_id, 0.0)
+            return RecognizeResponse(
+                status="spoof_detected",
+                message="Liveness challenge failed.",
+            )
+
+        # VERIFIED — proceed to clock-in/out
+        avg_distance = info["avg_distance"]
+        now = time.time()
+        last_seen = state.cooldown.get(active_identity, 0)
+        if now - last_seen < state.cooldown_seconds:
+            remaining = int(state.cooldown_seconds - (now - last_seen))
+            return RecognizeResponse(
+                status="cooldown",
+                identity=active_identity,
+                distance=round(avg_distance, 4),
+                message=f"Already recorded. Please wait {remaining}s.",
+            )
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        last_record = get_last_attendance(state.db_conn, active_identity, today_str)
+        is_clock_in = last_record is None or not last_record["is_clock_in"]
+        log_attendance(state.db_conn, active_identity, avg_distance, is_clock_in, camera_id)
+        state.cooldown[active_identity] = now
+        action = "Clocked In" if is_clock_in else "Clocked Out"
+        print(f"[ATTENDANCE] {active_identity} — {action} (avg_dist={avg_distance:.4f})")
+        return RecognizeResponse(
+            status="recognized",
+            identity=active_identity,
+            distance=round(avg_distance, 4),
+            is_clock_in=is_clock_in,
+            message=f"{action}: {active_identity}",
+        )
+
     # ── Step 4: Anti-spoof check ──
-    if state.anti_spoof is not None:
+    # Skip during an active liveness challenge — mid-blink frames score low on
+    # MiniFAS (eyes partially closed), which would abort the challenge incorrectly.
+    if state.anti_spoof is not None and not state.liveness.sessions:
         face_crop = frame_rgb[y:y+h, x:x+w]
         if face_crop.size > 0:
             is_real, spoof_score = state.anti_spoof.check(face_crop)
             print(f"[ANTI-SPOOF] is_real={is_real}, score={spoof_score:.4f}")
             if not is_real:
-                # Reset any pending consensus for all identities
-                state.pending.clear()
-                log_spoof_attempt(state.db_conn, camera_id, spoof_score)
+                # Debounce: a single borderline dip shouldn't kill consensus.
+                # Require 2 consecutive spoof-positive frames before aborting —
+                # real attacks score low consistently, real faces only flicker.
+                state.spoof_streak += 1
+                if state.spoof_streak >= 2:
+                    state.pending.clear()
+                    state.spoof_streak = 0
+                    log_spoof_attempt(state.db_conn, camera_id, spoof_score)
+                    return RecognizeResponse(
+                        status="spoof_detected",
+                        message="Liveness check failed.",
+                    )
+                # First dip — skip this frame, keep consensus intact
                 return RecognizeResponse(
-                    status="spoof_detected",
-                    message="Liveness check failed.",
+                    status="no_face",
+                    message="Hold still.",
                 )
+            else:
+                state.spoof_streak = 0
 
     # ── Step 5: Align face ──
     if state.do_align and landmarks is not None:
@@ -418,56 +707,7 @@ async def recognize(request: Request, body: RecognizeRequest):
             message=f"Already recorded. Please wait {remaining}s.",
         )
 
-    # ── Step 9: Check for active liveness challenge first ──
-    # If a challenge is already in progress for this identity, skip consensus
-    # and go straight to liveness processing.
-    active_session = state.liveness.get_session(label)
-    if active_session is not None:
-        liveness_state, info = state.liveness.process_frame(
-            label, landmarks, frame_rgb, distance
-        )
-
-        if liveness_state == SessionState.CHALLENGE_ACTIVE:
-            challenge_instructions = {
-                "blink": "Please BLINK",
-                "nod": "Please NOD slowly",
-            }
-            ctype = info["challenge_type"]
-            return RecognizeResponse(
-                status="liveness_challenge",
-                identity=label,
-                distance=round(distance, 4),
-                challenge_type=ctype,
-                challenge_instruction=challenge_instructions[ctype],
-                challenge_time_remaining=info["time_remaining"],
-                message=challenge_instructions[ctype],
-            )
-
-        if liveness_state == SessionState.FAILED:
-            log_spoof_attempt(state.db_conn, camera_id, 0.0)
-            return RecognizeResponse(
-                status="spoof_detected",
-                message="Liveness challenge failed.",
-            )
-
-        # SessionState.VERIFIED — proceed to clock-in/out
-        avg_distance = info["avg_distance"]
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        last_record = get_last_attendance(state.db_conn, label, today_str)
-        is_clock_in = last_record is None or not last_record["is_clock_in"]
-        log_attendance(state.db_conn, label, avg_distance, is_clock_in, camera_id)
-        state.cooldown[label] = now
-        action = "Clocked In" if is_clock_in else "Clocked Out"
-        print(f"[ATTENDANCE] {label} — {action} (avg_dist={avg_distance:.4f})")
-        return RecognizeResponse(
-            status="recognized",
-            identity=label,
-            distance=round(avg_distance, 4),
-            is_clock_in=is_clock_in,
-            message=f"{action}: {label}",
-        )
-
-    # ── Step 10: Identity consensus (confirm same person across N frames) ──
+    # ── Step 9: Identity consensus (confirm same person across N frames) ──
     consensus_required = state.consensus_required
     pending = state.pending.get(label)
 
@@ -513,10 +753,172 @@ async def recognize(request: Request, body: RecognizeRequest):
     )
 
 
-# ── K3 stubs (enrollment — implemented in Phase K3) ──
-# POST /api/enroll — add new employee
-# DELETE /api/enroll/{employee_id} — soft-delete employee
-# GET /api/employees — list active employees
+@app.post("/api/enroll")
+async def enroll(request: Request, body: EnrollRequest):
+    """Enroll a new employee via live camera capture."""
+    state = request.app.state
+
+    # ── Validate and sanitize name (prevent path traversal) ──
+    first = re.sub(r"[^a-zA-Z\s-]", "", body.first_name).strip().lower()
+    last = re.sub(r"[^a-zA-Z\s-]", "", body.last_name).strip().lower()
+    if not first or not last:
+        return EnrollResponse(status="error", message="First and last name are required (letters, spaces, hyphens only).")
+
+    first = re.sub(r"\s+", "_", first)
+    last = re.sub(r"\s+", "_", last)
+    employee_name = f"{first}_{last}"
+
+    # ── Check duplicate ──
+    if employee_name in state.known_labels:
+        return EnrollResponse(
+            status="already_exists",
+            message="This employee is already enrolled.",
+        )
+
+    # ── Decode image ──
+    try:
+        image_data = body.image
+        if "," in image_data and image_data.index(",") < 100:
+            image_data = image_data.split(",", 1)[1]
+        raw_bytes = base64.b64decode(image_data)
+        np_arr = np.frombuffer(raw_bytes, np.uint8)
+        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame_bgr is None:
+            return EnrollResponse(status="error", message="Failed to decode image.", employee_name=employee_name)
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    except Exception as e:
+        return EnrollResponse(status="error", message=f"Image decode failed: {e}", employee_name=employee_name)
+
+    # ── Detect face ──
+    detections = state.detector.detect(frame_rgb)
+    if len(detections) == 0:
+        return EnrollResponse(status="no_face", message="No face detected — try again.", employee_name=employee_name)
+    if len(detections) > 1:
+        return EnrollResponse(
+            status="multiple_faces",
+            message="Multiple faces detected — only you should be in frame.",
+            employee_name=employee_name,
+        )
+
+    (x, y, w, h), landmarks = detections[0]
+
+    # ── Anti-spoof check ──
+    if state.anti_spoof is not None:
+        face_crop = frame_rgb[y:y+h, x:x+w]
+        if face_crop.size > 0:
+            is_real, spoof_score = state.anti_spoof.check(face_crop)
+            if not is_real:
+                return EnrollResponse(
+                    status="spoof_detected",
+                    message="Liveness check failed — use your real face.",
+                    employee_name=employee_name,
+                )
+
+    # ── Align face ──
+    if state.do_align and landmarks is not None:
+        aligned = align_face(frame_rgb, landmarks, 112)
+        aligned = np.ascontiguousarray(aligned)
+    else:
+        face_roi = frame_rgb[y:y+h, x:x+w]
+        aligned = np.ascontiguousarray(face_roi) if face_roi.size > 0 else None
+
+    if aligned is None:
+        return EnrollResponse(status="error", message="Face alignment failed.", employee_name=employee_name)
+
+    # ── Embed ──
+    embedding = state.embedder.embed(aligned)
+    if embedding is None:
+        return EnrollResponse(status="error", message="Embedding extraction failed.", employee_name=employee_name)
+
+    # ── Persist to pkl (before in-memory and photo — safer ordering) ──
+    try:
+        save_encoding_to_pkl(args.database, embedding, employee_name)
+    except Exception as e:
+        return EnrollResponse(status="error", message=f"Failed to save encoding: {e}", employee_name=employee_name)
+
+    # ── Save photo (after pkl — no orphan files on failure) ──
+    employees_dir = Path(args.database).parent / "employees"
+    employees_dir.mkdir(parents=True, exist_ok=True)
+    photo_file = employees_dir / f"{employee_name}.jpg"
+    cv2.imwrite(str(photo_file), frame_bgr)
+
+    # ── Hot-reload in-memory ──
+    state.known_encodings.append(embedding.tolist())
+    state.known_labels.append(employee_name)
+
+    # ── Insert into employees table ──
+    ts = datetime.now(timezone.utc).isoformat()
+    state.db_conn.execute(
+        "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active) "
+        "VALUES (?, ?, ?, ?, 1) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "is_active = 1, enrolled_at = excluded.enrolled_at, photo_path = excluded.photo_path",
+        (employee_name, f"{first} {last}", ts, str(photo_file)),
+    )
+    state.db_conn.commit()
+
+    print(f"[ENROLL] {employee_name} enrolled successfully")
+    return EnrollResponse(
+        status="enrolled",
+        message=f"{employee_name} enrolled successfully!",
+        employee_name=employee_name,
+    )
+
+
+@app.delete("/api/enroll/{employee_id}")
+async def delete_employee(request: Request, employee_id: str):
+    """Remove an employee from recognition and mark as inactive."""
+    state = request.app.state
+
+    # ── Check exists and is active ──
+    row = state.db_conn.execute(
+        "SELECT photo_path FROM employees WHERE id = ? AND is_active = 1",
+        (employee_id,),
+    ).fetchone()
+    if row is None:
+        return {"status": "not_found", "message": f"No active employee found with id '{employee_id}'.", "employee_id": employee_id}
+
+    photo_path = row[0]
+
+    # ── Remove from pkl (before in-memory — safer ordering) ──
+    try:
+        remove_encoding_from_pkl(args.database, employee_id)
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to update encoding database: {e}", "employee_id": employee_id}
+
+    # ── Hot-reload in-memory: filter both parallel lists ──
+    pairs = [(enc, lbl) for enc, lbl in zip(state.known_encodings, state.known_labels) if lbl != employee_id]
+    if pairs:
+        state.known_encodings, state.known_labels = map(list, zip(*pairs))
+    else:
+        state.known_encodings, state.known_labels = [], []
+
+    # ── Soft-delete in SQLite ──
+    deactivate_employee(state.db_conn, employee_id)
+
+    # ── Delete photo file ──
+    if photo_path:
+        try:
+            Path(photo_path).unlink(missing_ok=True)
+        except Exception:
+            pass  # Non-fatal — record is already deactivated
+
+    # ── Clear in-memory state for this identity ──
+    state.cooldown.pop(employee_id, None)
+    state.pending.pop(employee_id, None)
+
+    print(f"[DELETE] {employee_id} removed")
+    return {"status": "deleted", "message": f"{employee_id} removed successfully.", "employee_id": employee_id}
+
+
+@app.get("/api/employees")
+async def list_employees(request: Request):
+    """Return all active enrolled employees."""
+    employees = get_active_employees(request.app.state.db_conn)
+    for emp in employees:
+        photo_path = emp.pop("photo_path")
+        emp["has_photo"] = bool(photo_path and Path(photo_path).exists())
+    return {"employees": employees, "count": len(employees)}
 
 
 # ═══════════════════════════════════════════════════════════════════════
