@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manage Employees</title>
+  <link rel="stylesheet" href="/static/report.css">
+  <style>
+    /* PIN gate (same pattern as enroll.html) */
+    .pin-gate {
+      position: fixed;
+      inset: 0;
+      background: #0f172a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      z-index: 1000;
+    }
+    .pin-gate.hidden { display: none; }
+    .pin-gate h2 { color: #e2e8f0; font-size: 22px; margin: 0; }
+    .pin-gate p { color: #94a3b8; font-size: 14px; margin: 0; }
+    .pin-gate-input {
+      width: 240px;
+      padding: 16px;
+      font-size: 24px;
+      text-align: center;
+      letter-spacing: 6px;
+      border: 2px solid #334155;
+      border-radius: 10px;
+      background: #1e293b;
+      color: #e2e8f0;
+      outline: none;
+    }
+    .pin-gate-input:focus { border-color: #3b82f6; }
+    .pin-gate-error { color: #ef4444; font-size: 14px; min-height: 20px; }
+    .pin-gate-btn {
+      width: 240px;
+      padding: 16px;
+      font-size: 18px;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      background: #3b82f6;
+      color: #fff;
+      cursor: pointer;
+    }
+    .pin-gate-btn:hover { background: #2563eb; }
+    .pin-gate-btn:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+    .back-link { color: #94a3b8; text-decoration: none; font-size: 14px; }
+    .back-link:hover { color: #e2e8f0; }
+
+    .report-container.hidden { display: none; }
+
+    /* Action buttons */
+    .action-btns { display: inline-flex; gap: 8px; }
+    .action-btn {
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 6px;
+      background: transparent;
+      cursor: pointer;
+    }
+    .view-btn {
+      border: 1px solid #3b82f6;
+      color: #3b82f6;
+    }
+    .view-btn:hover { background: #3b82f6; color: #fff; }
+    .view-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .delete-btn {
+      border: 1px solid #ef4444;
+      color: #ef4444;
+    }
+    .delete-btn:hover { background: #ef4444; color: #fff; }
+    .delete-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Photo modal */
+    .photo-modal {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 20px;
+      max-width: 90vw;
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .photo-modal img {
+      max-width: 480px;
+      max-height: 70vh;
+      border-radius: 8px;
+      object-fit: contain;
+    }
+    .photo-modal .photo-name {
+      color: #f8fafc;
+      font-size: 16px;
+      font-weight: 600;
+    }
+    .photo-modal .photo-id {
+      color: #94a3b8;
+      font-size: 13px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .photo-modal .photo-close {
+      margin-top: 4px;
+      padding: 8px 18px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 8px;
+      background: transparent;
+      color: #94a3b8;
+      border: 1px solid #334155;
+      cursor: pointer;
+    }
+    .photo-modal .photo-close:hover { color: #f8fafc; border-color: #64748b; }
+    .photo-missing {
+      color: #94a3b8;
+      font-size: 14px;
+      padding: 32px;
+      text-align: center;
+    }
+
+    /* Confirm modal photo */
+    .confirm-photo {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      object-fit: cover;
+      align-self: center;
+      border: 2px solid #334155;
+    }
+    .confirm-photo-placeholder {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      background: #334155;
+      align-self: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #94a3b8;
+      font-size: 32px;
+      font-weight: 600;
+    }
+
+    /* Confirmation modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.85);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 2000;
+    }
+    .modal-backdrop.hidden { display: none; }
+    .modal {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 24px;
+      width: 420px;
+      max-width: 90vw;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .modal h3 { color: #f8fafc; font-size: 18px; margin: 0; }
+    .modal p { color: #94a3b8; font-size: 14px; margin: 0; line-height: 1.5; }
+    .modal-actions { display: flex; gap: 12px; justify-content: flex-end; }
+    .modal-btn {
+      padding: 10px 20px;
+      font-size: 14px;
+      font-weight: 600;
+      border-radius: 8px;
+      cursor: pointer;
+      border: 1px solid transparent;
+    }
+    .modal-btn-cancel {
+      background: transparent;
+      color: #94a3b8;
+      border-color: #334155;
+    }
+    .modal-btn-cancel:hover { color: #f8fafc; border-color: #64748b; }
+    .modal-btn-confirm {
+      background: #ef4444;
+      color: #fff;
+    }
+    .modal-btn-confirm:hover { background: #dc2626; }
+    .modal-btn-confirm:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      z-index: 3000;
+      animation: slideIn 0.2s ease-out;
+    }
+    .toast.hidden { display: none; }
+    .toast-success { background: #14532d; color: #22c55e; border: 1px solid #22c55e; }
+    .toast-error   { background: #5b1717; color: #ef4444; border: 1px solid #ef4444; }
+    @keyframes slideIn {
+      from { transform: translateX(20px); opacity: 0; }
+      to   { transform: translateX(0);    opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div id="pin-gate" class="pin-gate">
+    <h2>Manager Access Required</h2>
+    <p>Enter the manager PIN to continue.</p>
+    <input type="password" id="pin-gate-input" class="pin-gate-input" inputmode="numeric" autocomplete="off" />
+    <button id="pin-gate-submit" class="pin-gate-btn">Unlock</button>
+    <div id="pin-gate-error" class="pin-gate-error"></div>
+    <a href="/" class="back-link">&#8592; Back to Clock-In</a>
+  </div>
+
+  <div id="main-container" class="report-container hidden">
+
+    <header class="report-header">
+      <div>
+        <h1>Manage Employees</h1>
+        <div id="store-label" style="font-size:13px; color:#64748b; margin-top:2px;"></div>
+      </div>
+      <nav class="report-nav">
+        <a href="/">Clock-In</a>
+        <a href="/enroll">Enroll</a>
+        <a href="/report">Reports</a>
+      </nav>
+    </header>
+
+    <div class="table-wrapper" id="table-wrapper" style="display:none">
+      <table class="report-table">
+        <thead>
+          <tr>
+            <th>Employee</th>
+            <th>ID</th>
+            <th>Enrolled</th>
+            <th style="text-align:right;">Action</th>
+          </tr>
+        </thead>
+        <tbody id="employees-tbody"></tbody>
+      </table>
+    </div>
+
+    <div id="empty-state" class="empty-state" style="display:none">
+      No employees enrolled at this store.
+    </div>
+
+    <div id="status-bar" class="status-bar">
+      <span id="status-dot" class="status-dot dot-idle"></span>
+      <span id="status-text">Loading employees...</span>
+    </div>
+  </div>
+
+  <div id="modal-backdrop" class="modal-backdrop hidden">
+    <div class="modal">
+      <h3>Remove Employee?</h3>
+      <div id="modal-photo-slot"></div>
+      <p id="modal-text">This will remove the employee from recognition. They will not be able to clock in until re-enrolled. This cannot be undone.</p>
+      <div class="modal-actions">
+        <button id="modal-cancel" class="modal-btn modal-btn-cancel">Cancel</button>
+        <button id="modal-confirm" class="modal-btn modal-btn-confirm">Remove</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="photo-backdrop" class="modal-backdrop hidden">
+    <div class="photo-modal">
+      <div id="photo-slot"></div>
+      <div id="photo-name" class="photo-name"></div>
+      <div id="photo-id" class="photo-id"></div>
+      <button id="photo-close" class="photo-close">Close</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/manage.js?v=2"></script>
+</body>
+</html>

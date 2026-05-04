@@ -94,6 +94,7 @@ data/employees/*
 
 #--- Internal planning docs ---
 roadmap.md
+PROD_HARDENING.md
 
 #--- Tests ---
 tests/

@@ -99,12 +99,77 @@
     .name-hint.hidden {
       display: none;
     }
+
+    .pin-gate {
+      position: fixed;
+      inset: 0;
+      background: #0f172a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      z-index: 1000;
+    }
+
+    .pin-gate.hidden {
+      display: none;
+    }
+
+    .pin-gate h2 {
+      color: #e2e8f0;
+      font-size: 22px;
+      margin: 0;
+    }
+
+    .pin-gate p {
+      color: #94a3b8;
+      font-size: 14px;
+      margin: 0;
+    }
+
+    .pin-gate-input {
+      width: 240px;
+      padding: 16px;
+      font-size: 24px;
+      text-align: center;
+      letter-spacing: 6px;
+      border: 2px solid #334155;
+      border-radius: 10px;
+      background: #1e293b;
+      color: #e2e8f0;
+      outline: none;
+    }
+
+    .pin-gate-input:focus {
+      border-color: #3b82f6;
+    }
+
+    .pin-gate-error {
+      color: #ef4444;
+      font-size: 14px;
+      min-height: 20px;
+    }
+
+    .kiosk-container.hidden {
+      display: none;
+    }
   </style>
 </head>
 <body>
-  <div class="kiosk-container">
+  <div id="pin-gate" class="pin-gate">
+    <h2>Manager Access Required</h2>
+    <p>Enter the manager PIN to continue.</p>
+    <input type="password" id="pin-gate-input" class="pin-gate-input" inputmode="numeric" autocomplete="off" />
+    <button id="pin-gate-submit" class="enroll-btn" style="width:240px;">Unlock</button>
+    <div id="pin-gate-error" class="pin-gate-error"></div>
+    <a href="/" class="back-link">&#8592; Back to Clock-In</a>
+  </div>
+
+  <div id="main-container" class="kiosk-container hidden">
     <header class="kiosk-header">
       <h1>Enroll New Employee</h1>
+      <div id="store-label" style="font-size:14px; color:#64748b; margin-top:2px;"></div>
     </header>
 
     <div class="camera-section">
@@ -136,11 +201,12 @@
       <span id="status-text">Initializing camera...</span>
       <span style="margin-left: auto; display: flex; gap: 16px;">
         <a href="/" class="back-link">&#8592; Back to Clock-In</a>
+        <a href="/manage" class="back-link">Manage</a>
         <a href="/report" class="back-link">Reports &#8594;</a>
       </span>
     </div>
   </div>
 
-  <script src="/static/enroll.js"></script>
+  <script src="/static/enroll.js?v=3"></script>
 </body>
 </html>

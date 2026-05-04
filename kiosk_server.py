@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import cv2
 import numpy as np
@@ -44,6 +45,21 @@ from recognize import find_best_match, load_database
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def _to_local(ts: str, tz: ZoneInfo) -> str:
+    """Convert a UTC ISO timestamp string to the given local timezone (no tz suffix)."""
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return ts
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # SQLite Database Layer
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -60,7 +76,8 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
             name        TEXT NOT NULL,
             enrolled_at TEXT NOT NULL,
             photo_path  TEXT,
-            is_active   INTEGER NOT NULL DEFAULT 1
+            is_active   INTEGER NOT NULL DEFAULT 1,
+            store_id    TEXT NOT NULL DEFAULT 'store-01'
         );
 
         CREATE TABLE IF NOT EXISTS attendance (
@@ -84,6 +101,13 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_attendance_employee  ON attendance(employee_id);
         CREATE INDEX IF NOT EXISTS idx_spoof_timestamp      ON spoof_attempts(timestamp);
     """)
+
+    # Migration: add store_id to existing databases that predate this column
+    try:
+        conn.execute("ALTER TABLE employees ADD COLUMN store_id TEXT NOT NULL DEFAULT 'store-01'")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     conn.commit()
     return conn
 
@@ -206,10 +230,12 @@ def deactivate_employee(conn: sqlite3.Connection, employee_id: str) -> bool:
     return cursor.rowcount > 0
 
 
-def get_active_employees(conn: sqlite3.Connection) -> List[Dict]:
-    """Return all active enrolled employees."""
+def get_active_employees(conn: sqlite3.Connection, store_id: str) -> List[Dict]:
+    """Return all active enrolled employees for a given store."""
     rows = conn.execute(
-        "SELECT id, name, enrolled_at, photo_path FROM employees WHERE is_active = 1 ORDER BY name"
+        "SELECT id, name, enrolled_at, photo_path FROM employees "
+        "WHERE is_active = 1 AND store_id = ? ORDER BY name",
+        (store_id,),
     ).fetchall()
     return [
         {"id": r[0], "name": r[1], "enrolled_at": r[2], "photo_path": r[3]}
@@ -299,6 +325,14 @@ def parse_args():
                    help="Attendance record retention (days)")
     p.add_argument("--spoof-retention-days", type=int, default=90,
                    help="Spoof attempt record retention (days)")
+    p.add_argument("--store-id", default="store-01",
+                   dest="store_id",
+                   help="Identifier for this store location (e.g. 'downtown-01')")
+    p.add_argument("--enrollment-pin", default=None,
+                   dest="enrollment_pin",
+                   help="Manager PIN required to enroll/delete employees (optional)")
+    p.add_argument("--timezone", default="UTC",
+                   help="Local timezone for report timestamps (e.g. 'America/New_York')")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8000)
     return p.parse_args()
@@ -321,6 +355,13 @@ STATIC_DIR = Path(__file__).parent / "static"
 async def lifespan(app: FastAPI):
     """Load all ML models and database once at startup."""
     print("[STARTUP] Loading models and database...")
+
+    # Validate timezone early — fail fast before touching ML models
+    try:
+        local_tz = ZoneInfo(args.timezone)
+    except Exception:
+        print(f"[ERROR] Unknown timezone '{args.timezone}'. Use a tz database name like 'America/New_York'.")
+        sys.exit(1)
 
     # ML pipeline
     app.state.detector = create_detector(args.detector)
@@ -361,8 +402,13 @@ async def lifespan(app: FastAPI):
     app.state.cooldown_seconds = args.cooldown
     app.state.consensus_required = args.consensus
     app.state.camera_id = args.camera_id
+    app.state.store_id = args.store_id
+    app.state.enrollment_pin = args.enrollment_pin
+    app.state.local_tz = local_tz
 
-    print(f"[STARTUP] Ready — {len(labels)} employees, threshold={args.threshold}, "
+    pin_status = "protected" if args.enrollment_pin else "open"
+    print(f"[STARTUP] Ready — store={args.store_id}, tz={args.timezone}, "
+          f"enrollment={pin_status}, {len(labels)} employees, threshold={args.threshold}, "
           f"cooldown={args.cooldown}s, consensus={args.consensus} frames, "
           f"spoof_threshold={args.spoof_threshold}, challenge_timeout={args.challenge_timeout}s")
     yield
@@ -385,12 +431,17 @@ class EnrollRequest(BaseModel):
     image: str        # base64-encoded JPEG (with or without data URI prefix)
     first_name: str
     last_name: str
+    pin: Optional[str] = None  # manager PIN if server is PIN-protected
 
 
 class EnrollResponse(BaseModel):
-    status: str  # enrolled, already_exists, no_face, multiple_faces, spoof_detected, error
+    status: str  # enrolled, unauthorized, no_face, multiple_faces, spoof_detected, error
     message: str = ""
-    employee_name: str = ""  # stored as firstname_lastname
+    employee_name: str = ""  # stored as firstname_lastname (or firstname_lastname_2 on collision)
+
+
+class VerifyPinRequest(BaseModel):
+    pin: Optional[str] = None
 
 
 class RecognizeRequest(BaseModel):
@@ -427,6 +478,24 @@ async def serve_enroll():
     return FileResponse(str(STATIC_DIR / "enroll.html"))
 
 
+@app.post("/api/verify-pin")
+async def verify_pin(request: Request, body: VerifyPinRequest):
+    """Verify a manager PIN. Used by the enrollment page gate.
+
+    If the server has no PIN configured, returns valid=true unconditionally
+    (the enroll/delete endpoints also skip the check in that case)."""
+    state = request.app.state
+    if not state.enrollment_pin:
+        return {"valid": True, "protected": False}
+    return {"valid": body.pin == state.enrollment_pin, "protected": True}
+
+
+@app.get("/manage")
+async def serve_manage():
+    """Serve the manage employees page."""
+    return FileResponse(str(STATIC_DIR / "manage.html"))
+
+
 @app.get("/report")
 async def serve_report():
     """Serve the manager report page."""
@@ -436,16 +505,20 @@ async def serve_report():
 @app.get("/api/health")
 async def health(request: Request):
     """Server health and configuration summary."""
+    state = request.app.state
     return {
         "status": "ok",
+        "store_id": state.store_id,
+        "timezone": str(state.local_tz),
+        "enrollment_protected": bool(state.enrollment_pin),
         "detector": args.detector,
         "embedder": args.embedder,
         "anti_spoof": args.anti_spoof,
-        "employee_count": len(request.app.state.known_labels),
-        "unique_employees": len(set(request.app.state.known_labels)),
-        "threshold": request.app.state.threshold,
-        "cooldown_seconds": request.app.state.cooldown_seconds,
-        "consensus_required": request.app.state.consensus_required,
+        "employee_count": len(state.known_labels),
+        "unique_employees": len(set(state.known_labels)),
+        "threshold": state.threshold,
+        "cooldown_seconds": state.cooldown_seconds,
+        "consensus_required": state.consensus_required,
     }
 
 
@@ -483,10 +556,16 @@ async def get_report(
     records = get_report_records(conn, start_bound, end_bound, employee or None)
     spoof_count = get_spoof_count_for_range(conn, start_bound, end_bound)
 
+    local_tz = request.app.state.local_tz
+    for r in records:
+        r["timestamp"] = _to_local(r["timestamp"], local_tz)
+
     return {
         "start": start,
         "end": end,
         "employee_filter": employee or None,
+        "store_id": request.app.state.store_id,
+        "timezone": str(local_tz),
         "records": records,
         "count": len(records),
         "summary": {
@@ -523,17 +602,22 @@ async def get_report_csv(
         employee or None,
     )
 
+    local_tz = request.app.state.local_tz
+    store_id = request.app.state.store_id
+    for r in records:
+        r["timestamp"] = _to_local(r["timestamp"], local_tz)
+
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Date", "Time (UTC)", "Employee ID", "Employee Name",
-                     "Event Type", "Confidence", "Camera"])
+    writer.writerow(["Date", f"Time ({local_tz})", "Employee ID", "Employee Name",
+                     "Event Type", "Confidence", "Camera", "Store"])
     for r in records:
         ts = r["timestamp"]
         confidence = f"{max(0.0, (1.0 - r['distance']) * 100):.2f}%"
         writer.writerow([
             ts[:10], ts[11:19], r["employee_id"], r["employee_name"],
             "Clock In" if r["is_clock_in"] else "Clock Out",
-            confidence, r["camera_id"],
+            confidence, r["camera_id"], store_id,
         ])
 
     filename = f"attendance_{start}_{end}.csv"
@@ -758,6 +842,10 @@ async def enroll(request: Request, body: EnrollRequest):
     """Enroll a new employee via live camera capture."""
     state = request.app.state
 
+    # ── PIN check ──
+    if state.enrollment_pin and body.pin != state.enrollment_pin:
+        return EnrollResponse(status="unauthorized", message="Invalid PIN.")
+
     # ── Validate and sanitize name (prevent path traversal) ──
     first = re.sub(r"[^a-zA-Z\s-]", "", body.first_name).strip().lower()
     last = re.sub(r"[^a-zA-Z\s-]", "", body.last_name).strip().lower()
@@ -766,14 +854,31 @@ async def enroll(request: Request, body: EnrollRequest):
 
     first = re.sub(r"\s+", "_", first)
     last = re.sub(r"\s+", "_", last)
-    employee_name = f"{first}_{last}"
+    base_name = f"{first}_{last}"
 
-    # ── Check duplicate ──
-    if employee_name in state.known_labels:
-        return EnrollResponse(
-            status="already_exists",
-            message="This employee is already enrolled.",
-        )
+    # ── Resolve employee name (auto-suffix on collision) ──
+    conn = state.db_conn
+    inactive = conn.execute(
+        "SELECT id FROM employees WHERE id = ? AND is_active = 0", (base_name,)
+    ).fetchone()
+
+    if inactive:
+        # Same base name exists but is soft-deleted — this is a re-enrollment
+        employee_name = base_name
+    else:
+        # Find all existing IDs (active + inactive) matching this base
+        existing_ids = {
+            row[0] for row in conn.execute(
+                "SELECT id FROM employees WHERE id = ? OR id LIKE ?",
+                (base_name, f"{base_name}_%"),
+            ).fetchall()
+        }
+        existing_ids.update(state.known_labels)  # cover any pkl/SQLite drift
+        employee_name = base_name
+        suffix = 2
+        while employee_name in existing_ids:
+            employee_name = f"{base_name}_{suffix}"
+            suffix += 1
 
     # ── Decode image ──
     try:
@@ -849,11 +954,12 @@ async def enroll(request: Request, body: EnrollRequest):
     # ── Insert into employees table ──
     ts = datetime.now(timezone.utc).isoformat()
     state.db_conn.execute(
-        "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active) "
-        "VALUES (?, ?, ?, ?, 1) "
+        "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active, store_id) "
+        "VALUES (?, ?, ?, ?, 1, ?) "
         "ON CONFLICT(id) DO UPDATE SET "
-        "is_active = 1, enrolled_at = excluded.enrolled_at, photo_path = excluded.photo_path",
-        (employee_name, f"{first} {last}", ts, str(photo_file)),
+        "is_active = 1, enrolled_at = excluded.enrolled_at, "
+        "photo_path = excluded.photo_path, store_id = excluded.store_id",
+        (employee_name, f"{first} {last}", ts, str(photo_file), state.store_id),
     )
     state.db_conn.commit()
 
@@ -866,9 +972,13 @@ async def enroll(request: Request, body: EnrollRequest):
 
 
 @app.delete("/api/enroll/{employee_id}")
-async def delete_employee(request: Request, employee_id: str):
+async def delete_employee(request: Request, employee_id: str, pin: Optional[str] = Query(default=None)):
     """Remove an employee from recognition and mark as inactive."""
     state = request.app.state
+
+    # ── PIN check ──
+    if state.enrollment_pin and pin != state.enrollment_pin:
+        return {"status": "unauthorized", "message": "Invalid PIN.", "employee_id": employee_id}
 
     # ── Check exists and is active ──
     row = state.db_conn.execute(
@@ -911,10 +1021,33 @@ async def delete_employee(request: Request, employee_id: str):
     return {"status": "deleted", "message": f"{employee_id} removed successfully.", "employee_id": employee_id}
 
 
+@app.get("/api/employee/{employee_id}/photo")
+async def get_employee_photo(request: Request, employee_id: str, pin: Optional[str] = Query(default=None)):
+    """Serve the enrollment photo for an employee. PIN-gated."""
+    state = request.app.state
+
+    if state.enrollment_pin and pin != state.enrollment_pin:
+        return JSONResponse({"status": "unauthorized", "message": "Invalid PIN."}, status_code=401)
+
+    row = state.db_conn.execute(
+        "SELECT photo_path FROM employees WHERE id = ? AND store_id = ?",
+        (employee_id, state.store_id),
+    ).fetchone()
+    if row is None or not row[0]:
+        return JSONResponse({"status": "not_found", "message": "Photo not found."}, status_code=404)
+
+    photo_path = Path(row[0])
+    if not photo_path.exists():
+        return JSONResponse({"status": "not_found", "message": "Photo file missing on disk."}, status_code=404)
+
+    return FileResponse(str(photo_path), media_type="image/jpeg")
+
+
 @app.get("/api/employees")
 async def list_employees(request: Request):
-    """Return all active enrolled employees."""
-    employees = get_active_employees(request.app.state.db_conn)
+    """Return all active enrolled employees for this store."""
+    state = request.app.state
+    employees = get_active_employees(state.db_conn, state.store_id)
     for emp in employees:
         photo_path = emp.pop("photo_path")
         emp["has_photo"] = bool(photo_path and Path(photo_path).exists())

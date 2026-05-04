@@ -8,6 +8,27 @@
   var enrollBtn = document.getElementById("enroll-btn");
   var firstNameInput = document.getElementById("first-name");
   var lastNameInput = document.getElementById("last-name");
+  var storeLabel = document.getElementById("store-label");
+  var pinGate = document.getElementById("pin-gate");
+  var pinGateInput = document.getElementById("pin-gate-input");
+  var pinGateSubmit = document.getElementById("pin-gate-submit");
+  var pinGateError = document.getElementById("pin-gate-error");
+  var mainContainer = document.getElementById("main-container");
+
+  // ── PIN cache (per-tab session only) ──
+  var PIN_STORAGE_KEY = "kiosk_manager_pin";
+  var cachedPin = null;
+  function getCachedPin() {
+    try { return sessionStorage.getItem(PIN_STORAGE_KEY); } catch (e) { return null; }
+  }
+  function setCachedPin(pin) {
+    cachedPin = pin;
+    try { sessionStorage.setItem(PIN_STORAGE_KEY, pin); } catch (e) { /* non-fatal */ }
+  }
+  function clearCachedPin() {
+    cachedPin = null;
+    try { sessionStorage.removeItem(PIN_STORAGE_KEY); } catch (e) { /* non-fatal */ }
+  }
   var resultCard = document.getElementById("result-card");
   var resultIcon = document.getElementById("result-icon");
   var resultName = document.getElementById("result-name");
@@ -25,6 +46,73 @@
 
   var cameraReady = false;
   var lightingOk = true;
+
+  // ── Server config (store label) ──
+  async function loadServerConfig() {
+    try {
+      var health = await fetch("/api/health").then(function (r) { return r.json(); });
+      if (storeLabel) storeLabel.textContent = health.store_id || "";
+      return health;
+    } catch (e) {
+      return {};
+    }
+  }
+
+  // ── Verify PIN against server ──
+  async function verifyPin(pin) {
+    try {
+      var resp = await fetch("/api/verify-pin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin: pin }),
+      });
+      var data = await resp.json();
+      return data;
+    } catch (e) {
+      return { valid: false, protected: true };
+    }
+  }
+
+  // ── PIN gate flow ──
+  function showPinGate(errMsg) {
+    pinGate.classList.remove("hidden");
+    mainContainer.classList.add("hidden");
+    pinGateError.textContent = errMsg || "";
+    pinGateInput.value = "";
+    setTimeout(function () { pinGateInput.focus(); }, 50);
+  }
+
+  function hidePinGate() {
+    pinGate.classList.add("hidden");
+    mainContainer.classList.remove("hidden");
+  }
+
+  async function handlePinSubmit() {
+    var entered = pinGateInput.value.trim();
+    if (!entered) {
+      pinGateError.textContent = "Please enter a PIN.";
+      return;
+    }
+    pinGateSubmit.disabled = true;
+    pinGateSubmit.textContent = "Verifying...";
+    var result = await verifyPin(entered);
+    pinGateSubmit.disabled = false;
+    pinGateSubmit.textContent = "Unlock";
+    if (result.valid) {
+      setCachedPin(entered);
+      hidePinGate();
+      bootMain();
+    } else {
+      pinGateError.textContent = "Incorrect PIN.";
+      pinGateInput.value = "";
+      pinGateInput.focus();
+    }
+  }
+
+  pinGateSubmit.addEventListener("click", handlePinSubmit);
+  pinGateInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") handlePinSubmit();
+  });
 
   // ── Camera init ──
   async function initCamera() {
@@ -137,10 +225,11 @@
     var base64Data = dataUrl.split(",")[1];
 
     try {
+      var pinValue = cachedPin || getCachedPin();
       var resp = await fetch("/api/enroll", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: base64Data, first_name: firstName, last_name: lastName }),
+        body: JSON.stringify({ image: base64Data, first_name: firstName, last_name: lastName, pin: pinValue }),
       });
       var data = await resp.json();
       handleResult(data);
@@ -167,8 +256,11 @@
         setStatus("idle", "Ready \u2014 enter name and capture");
         break;
 
-      case "already_exists":
-        showResult({ icon: "\u26A0", name: "", action: data.message, cardClass: "result-warning" });
+      case "unauthorized":
+        // Cached PIN was rejected (likely rotated server-side). Re-gate the page.
+        clearCachedPin();
+        showResult({ icon: "\u26D4", name: "", action: "Session expired \u2014 re-enter PIN", cardClass: "result-spoof" });
+        setTimeout(function () { showPinGate("Please re-enter the manager PIN."); }, 1200);
         break;
 
       case "no_face":
@@ -209,5 +301,33 @@
   }
 
   // ── Boot ──
-  initCamera();
+  async function bootMain() {
+    await loadServerConfig();
+    initCamera();
+  }
+
+  async function boot() {
+    var health = await loadServerConfig();
+    if (!health.enrollment_protected) {
+      // No PIN configured — open enrollment, skip gate entirely
+      hidePinGate();
+      bootMain();
+      return;
+    }
+    // Try cached PIN first (manager unlocked earlier in this tab session)
+    var existing = getCachedPin();
+    if (existing) {
+      var result = await verifyPin(existing);
+      if (result.valid) {
+        cachedPin = existing;
+        hidePinGate();
+        bootMain();
+        return;
+      }
+      clearCachedPin();
+    }
+    showPinGate();
+  }
+
+  boot();
 })();
