@@ -333,7 +333,9 @@ def parse_args():
                    help="Manager PIN required to enroll/delete employees (optional)")
     p.add_argument("--timezone", default="UTC",
                    help="Local timezone for report timestamps (e.g. 'America/New_York')")
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="Bind address. Defaults to loopback so the API is only reachable from the same machine "
+                        "(the Pi-kiosk model). Set to '0.0.0.0' only if you intentionally want LAN exposure.")
     p.add_argument("--port", type=int, default=8000)
     return p.parse_args()
 
