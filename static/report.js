@@ -18,6 +18,18 @@
     statusDot.className = "status-dot dot-" + state;
   }
 
+  function loadServerConfig() {
+    fetch("/api/health")
+      .then(function (r) { return r.json(); })
+      .then(function (h) {
+        var storeLabel = document.getElementById("store-label");
+        if (storeLabel) storeLabel.textContent = h.store_id || "";
+        var timeHeader = document.getElementById("time-col-header");
+        if (timeHeader) timeHeader.textContent = "Time (" + (h.timezone || "UTC") + ")";
+      })
+      .catch(function () { /* non-fatal */ });
+  }
+
   function fmtDate(ts)       { return ts.slice(0, 10); }
   function fmtTime(ts)       { return ts.slice(11, 19); }
   function fmtConfidence(d)  { return Math.max(0, (1 - d) * 100).toFixed(1) + "%"; }
@@ -133,5 +145,6 @@
   csvBtn.addEventListener("click", exportCsv);
 
   initDates();
+  loadServerConfig();
   loadEmployees();
 })();

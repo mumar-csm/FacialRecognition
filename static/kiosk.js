@@ -247,5 +247,9 @@
   }
 
   // ── Boot ──
+  fetch("/api/health").then(function (r) { return r.json(); }).then(function (h) {
+    var lbl = document.getElementById("store-label");
+    if (lbl) lbl.textContent = h.store_id || "";
+  }).catch(function () {});
   initCamera();
 })();

@@ -10,7 +10,10 @@
   <div class="kiosk-container">
     <header class="kiosk-header">
       <h1>Employee Clock-In</h1>
-      <div id="clock" class="clock"></div>
+      <div style="display:flex; align-items:center; gap:16px;">
+        <span id="store-label" style="font-size:13px; color:#64748b;"></span>
+        <div id="clock" class="clock"></div>
+      </div>
     </header>
 
     <div class="camera-section">
@@ -33,7 +36,11 @@
     <div id="status-bar" class="status-bar">
       <span id="status-dot" class="status-dot dot-idle"></span>
       <span id="status-text">Initializing camera...</span>
-      <span style="margin-left: auto;"><a href="/report" class="back-link">Reports &#8594;</a></span>
+      <span style="margin-left: auto; display: flex; gap: 16px;">
+        <a href="/enroll" class="back-link">Enroll</a>
+        <a href="/manage" class="back-link">Manage</a>
+        <a href="/report" class="back-link">Reports &#8594;</a>
+      </span>
     </div>
   </div>
 
