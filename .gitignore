@@ -102,3 +102,7 @@ tests/
 #--- Local DB backups ---
 data/kiosk.db.*
 data/*.bak
+
+#--- Central tier ---
+central/.env*
+!central/.env.example
