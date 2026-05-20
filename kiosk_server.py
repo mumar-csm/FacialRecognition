@@ -15,16 +15,18 @@ import argparse
 import base64
 import csv
 import io
+import json
 import os
 import pickle
 import re
 import sqlite3
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import cv2
@@ -42,6 +44,7 @@ from embedding_factory import create_embedder
 from euclideanDist import euclidean_distance
 from liveness import LivenessManager, SessionState
 from recognize import find_best_match, load_database
+from sync_worker import SyncWorker
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -97,9 +100,20 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
             spoof_score REAL NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS outbox (
+            event_uuid    TEXT PRIMARY KEY,
+            kind          TEXT NOT NULL,
+            payload_json  TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            sent_at       TEXT,
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            last_error    TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_attendance_timestamp ON attendance(timestamp);
         CREATE INDEX IF NOT EXISTS idx_attendance_employee  ON attendance(employee_id);
         CREATE INDEX IF NOT EXISTS idx_spoof_timestamp      ON spoof_attempts(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_outbox_unsent ON outbox(created_at) WHERE sent_at IS NULL;
     """)
 
     # Migration: add store_id to existing databases that predate this column
@@ -112,27 +126,67 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def log_attendance(conn: sqlite3.Connection, employee_id: str,
-                   distance: float, is_clock_in: bool, camera_id: str = "kiosk-01") -> int:
-    """Insert an attendance record. Returns the inserted row ID."""
-    ts = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "INSERT INTO attendance (timestamp, employee_id, distance, is_clock_in, camera_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (ts, employee_id, distance, int(is_clock_in), camera_id),
+def _enqueue_outbox(conn: sqlite3.Connection, kind: str,
+                    payload: Dict[str, Any], created_at: str) -> str:
+    """Insert an outbox row. Must be called inside an open transaction.
+
+    Returns the event_uuid so callers can correlate logs.
+    """
+    event_uuid = payload.setdefault("event_uuid", str(uuid.uuid4()))
+    conn.execute(
+        "INSERT INTO outbox (event_uuid, kind, payload_json, created_at) VALUES (?, ?, ?, ?)",
+        (event_uuid, kind, json.dumps(payload, separators=(",", ":")), created_at),
     )
-    conn.commit()
+    return event_uuid
+
+
+def log_attendance(conn: sqlite3.Connection, employee_id: str,
+                   distance: float, is_clock_in: bool,
+                   store_id: str, device_id: str,
+                   camera_id: str = "kiosk-01") -> int:
+    """Insert an attendance record + matching outbox row in one transaction.
+
+    Returns the inserted attendance row ID. The outbox row is what the sync
+    worker drains up to central; same transaction means we can't observe an
+    attendance row that hasn't been queued for upload.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "store_id": store_id,
+        "device_id": device_id,
+        "timestamp": ts,
+        "employee_id": employee_id,
+        "distance": distance,
+        "is_clock_in": bool(is_clock_in),
+        "camera_id": camera_id,
+    }
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO attendance (timestamp, employee_id, distance, is_clock_in, camera_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (ts, employee_id, distance, int(is_clock_in), camera_id),
+        )
+        _enqueue_outbox(conn, "attendance", payload, ts)
     return cursor.lastrowid
 
 
-def log_spoof_attempt(conn: sqlite3.Connection, camera_id: str, spoof_score: float) -> int:
-    """Insert a spoof attempt record. Returns the inserted row ID."""
+def log_spoof_attempt(conn: sqlite3.Connection, camera_id: str, spoof_score: float,
+                      store_id: str, device_id: str) -> int:
+    """Insert a spoof attempt record + matching outbox row in one transaction."""
     ts = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "INSERT INTO spoof_attempts (timestamp, camera_id, spoof_score) VALUES (?, ?, ?)",
-        (ts, camera_id, spoof_score),
-    )
-    conn.commit()
+    payload = {
+        "store_id": store_id,
+        "device_id": device_id,
+        "timestamp": ts,
+        "camera_id": camera_id,
+        "spoof_score": spoof_score,
+    }
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO spoof_attempts (timestamp, camera_id, spoof_score) VALUES (?, ?, ?)",
+            (ts, camera_id, spoof_score),
+        )
+        _enqueue_outbox(conn, "spoof_attempt", payload, ts)
     return cursor.lastrowid
 
 
@@ -218,16 +272,6 @@ def get_spoof_count_for_range(
         (start_bound, end_bound),
     ).fetchone()
     return row[0] if row else 0
-
-
-def deactivate_employee(conn: sqlite3.Connection, employee_id: str) -> bool:
-    """Soft-delete employee (is_active=0). Returns True if row was found and updated."""
-    cursor = conn.execute(
-        "UPDATE employees SET is_active = 0 WHERE id = ? AND is_active = 1",
-        (employee_id,),
-    )
-    conn.commit()
-    return cursor.rowcount > 0
 
 
 def get_active_employees(conn: sqlite3.Connection, store_id: str) -> List[Dict]:
@@ -325,9 +369,26 @@ def parse_args():
                    help="Attendance record retention (days)")
     p.add_argument("--spoof-retention-days", type=int, default=90,
                    help="Spoof attempt record retention (days)")
-    p.add_argument("--store-id", default="store-01",
+    p.add_argument("--store-id", default=None,
                    dest="store_id",
-                   help="Identifier for this store location (e.g. 'downtown-01')")
+                   help="Identifier for this store location (e.g. 'downtown-01'). "
+                        "Falls back to --device-config, then to 'store-01'.")
+    p.add_argument("--device-id", default=None, dest="device_id",
+                   help="Stable identifier for this Pi (e.g. 'pi-store-01-a'). "
+                        "Falls back to --device-config, then to the machine hostname.")
+    p.add_argument("--device-config", default=None, dest="device_config",
+                   help="Optional JSON file with device_id/store_id/central_url/sync_interval_seconds/sync_batch_size. "
+                        "CLI flags override individual fields. The API key is read from CENTRAL_API_KEY env var only.")
+    p.add_argument("--central-url", default=None, dest="central_url",
+                   help="Base URL of the central HQ server (e.g. https://central.example.com). "
+                        "If omitted, outbox rows are written but never drained — useful for dev/test.")
+    p.add_argument("--sync-interval-seconds", type=int, default=None,
+                   dest="sync_interval_seconds",
+                   help="How often the sync worker drains the outbox (seconds, production default 1800 = 30 min; "
+                        "override to 30 for dev/testing)")
+    p.add_argument("--sync-batch-size", type=int, default=None,
+                   dest="sync_batch_size",
+                   help="Max outbox rows per upload batch (default 50)")
     p.add_argument("--enrollment-pin", default=None,
                    dest="enrollment_pin",
                    help="Manager PIN required to enroll/delete employees (optional)")
@@ -337,7 +398,50 @@ def parse_args():
                    help="Bind address. Defaults to loopback so the API is only reachable from the same machine "
                         "(the Pi-kiosk model). Set to '0.0.0.0' only if you intentionally want LAN exposure.")
     p.add_argument("--port", type=int, default=8000)
-    return p.parse_args()
+    return _apply_device_config(p.parse_args())
+
+
+def _apply_device_config(args):
+    """Layer values from --device-config under the CLI flags, then apply final defaults.
+
+    Precedence: CLI flag > config file > hard default. The API key is intentionally
+    *not* read from the config file — it lives in CENTRAL_API_KEY env var only, so
+    it stays out of `ps aux` and out of any config file that might get committed.
+    """
+    cfg: Dict[str, Any] = {}
+    if args.device_config:
+        try:
+            with open(args.device_config) as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print(f"[ERROR] Failed to read --device-config {args.device_config}: {e}")
+            sys.exit(1)
+
+    # Fields that can come from CLI or config file
+    for field in ("device_id", "store_id", "central_url",
+                  "sync_interval_seconds", "sync_batch_size"):
+        if getattr(args, field, None) is None and field in cfg:
+            setattr(args, field, cfg[field])
+
+    # Hard defaults — applied last so config-file values still win
+    if args.store_id is None:
+        args.store_id = "store-01"
+    if args.device_id is None:
+        import socket
+        args.device_id = socket.gethostname() or "unknown-device"
+    if args.sync_interval_seconds is None:
+        args.sync_interval_seconds = 1800  # 30 min production default. Override to 30 for dev/testing.
+    if args.sync_batch_size is None:
+        args.sync_batch_size = 50
+
+    # Fail fast: enabling sync requires both a URL and an API key
+    if args.central_url:
+        if not os.environ.get("CENTRAL_API_KEY"):
+            print("[ERROR] --central-url is set but CENTRAL_API_KEY env var is empty. "
+                  "Refusing to start: the kiosk would write outbox rows that can't be uploaded.")
+            sys.exit(1)
+
+    return args
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -405,17 +509,38 @@ async def lifespan(app: FastAPI):
     app.state.consensus_required = args.consensus
     app.state.camera_id = args.camera_id
     app.state.store_id = args.store_id
+    app.state.device_id = args.device_id
     app.state.enrollment_pin = args.enrollment_pin
     app.state.local_tz = local_tz
 
     pin_status = "protected" if args.enrollment_pin else "open"
-    print(f"[STARTUP] Ready — store={args.store_id}, tz={args.timezone}, "
-          f"enrollment={pin_status}, {len(labels)} employees, threshold={args.threshold}, "
-          f"cooldown={args.cooldown}s, consensus={args.consensus} frames, "
-          f"spoof_threshold={args.spoof_threshold}, challenge_timeout={args.challenge_timeout}s")
+    sync_status = (f"central={args.central_url}, interval={args.sync_interval_seconds}s, "
+                   f"batch={args.sync_batch_size}") if args.central_url else "disabled"
+    print(f"[STARTUP] Ready — store={args.store_id}, device={args.device_id}, "
+          f"tz={args.timezone}, enrollment={pin_status}, {len(labels)} employees, "
+          f"threshold={args.threshold}, cooldown={args.cooldown}s, "
+          f"consensus={args.consensus} frames, spoof_threshold={args.spoof_threshold}, "
+          f"challenge_timeout={args.challenge_timeout}s, sync={sync_status}")
+
+    # Start the outbox sync worker if a central URL is configured. When it isn't,
+    # outbox rows still get written (kiosk works offline) — they just sit until
+    # the operator wires up --central-url.
+    app.state.sync_worker = None
+    if args.central_url:
+        app.state.sync_worker = SyncWorker(
+            db_path=args.sqlite,
+            central_url=args.central_url,
+            api_key=os.environ["CENTRAL_API_KEY"],
+            interval_seconds=args.sync_interval_seconds,
+            batch_size=args.sync_batch_size,
+        )
+        app.state.sync_worker.start()
+
     yield
 
     # Shutdown
+    if app.state.sync_worker is not None:
+        await app.state.sync_worker.stop()
     app.state.db_conn.commit()
     app.state.db_conn.close()
     print("[SHUTDOWN] Database connection closed.")
@@ -691,7 +816,8 @@ async def recognize(request: Request, body: RecognizeRequest):
             )
 
         if liveness_state == SessionState.FAILED:
-            log_spoof_attempt(state.db_conn, camera_id, 0.0)
+            log_spoof_attempt(state.db_conn, camera_id, 0.0,
+                              store_id=state.store_id, device_id=state.device_id)
             return RecognizeResponse(
                 status="spoof_detected",
                 message="Liveness challenge failed.",
@@ -712,7 +838,8 @@ async def recognize(request: Request, body: RecognizeRequest):
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         last_record = get_last_attendance(state.db_conn, active_identity, today_str)
         is_clock_in = last_record is None or not last_record["is_clock_in"]
-        log_attendance(state.db_conn, active_identity, avg_distance, is_clock_in, camera_id)
+        log_attendance(state.db_conn, active_identity, avg_distance, is_clock_in,
+                       store_id=state.store_id, device_id=state.device_id, camera_id=camera_id)
         state.cooldown[active_identity] = now
         action = "Clocked In" if is_clock_in else "Clocked Out"
         print(f"[ATTENDANCE] {active_identity} — {action} (avg_dist={avg_distance:.4f})")
@@ -740,7 +867,8 @@ async def recognize(request: Request, body: RecognizeRequest):
                 if state.spoof_streak >= 2:
                     state.pending.clear()
                     state.spoof_streak = 0
-                    log_spoof_attempt(state.db_conn, camera_id, spoof_score)
+                    log_spoof_attempt(state.db_conn, camera_id, spoof_score,
+                                      store_id=state.store_id, device_id=state.device_id)
                     return RecognizeResponse(
                         status="spoof_detected",
                         message="Liveness check failed.",
@@ -953,17 +1081,32 @@ async def enroll(request: Request, body: EnrollRequest):
     state.known_encodings.append(embedding.tolist())
     state.known_labels.append(employee_name)
 
-    # ── Insert into employees table ──
+    # ── Insert into employees table + queue enrollment event for central ──
     ts = datetime.now(timezone.utc).isoformat()
-    state.db_conn.execute(
-        "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active, store_id) "
-        "VALUES (?, ?, ?, ?, 1, ?) "
-        "ON CONFLICT(id) DO UPDATE SET "
-        "is_active = 1, enrolled_at = excluded.enrolled_at, "
-        "photo_path = excluded.photo_path, store_id = excluded.store_id",
-        (employee_name, f"{first} {last}", ts, str(photo_file), state.store_id),
-    )
-    state.db_conn.commit()
+    ok, photo_jpg = cv2.imencode(".jpg", frame_bgr)
+    photo_b64 = base64.b64encode(photo_jpg.tobytes()).decode("ascii") if ok else ""
+    encoding_bytes = np.asarray(embedding, dtype=np.float32).tobytes()
+    enrollment_payload = {
+        "store_id": state.store_id,
+        "device_id": state.device_id,
+        "timestamp": ts,
+        "employee_id": employee_name,
+        "display_name": f"{first} {last}",
+        "embedder_type": args.embedder,
+        "embedding_dim": int(np.asarray(embedding).size),
+        "encoding_b64": base64.b64encode(encoding_bytes).decode("ascii"),
+        "photo_b64": photo_b64,
+    }
+    with state.db_conn:
+        state.db_conn.execute(
+            "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active, store_id) "
+            "VALUES (?, ?, ?, ?, 1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "is_active = 1, enrolled_at = excluded.enrolled_at, "
+            "photo_path = excluded.photo_path, store_id = excluded.store_id",
+            (employee_name, f"{first} {last}", ts, str(photo_file), state.store_id),
+        )
+        _enqueue_outbox(state.db_conn, "enrollment", enrollment_payload, ts)
 
     print(f"[ENROLL] {employee_name} enrolled successfully")
     return EnrollResponse(
@@ -1005,8 +1148,20 @@ async def delete_employee(request: Request, employee_id: str, pin: Optional[str]
     else:
         state.known_encodings, state.known_labels = [], []
 
-    # ── Soft-delete in SQLite ──
-    deactivate_employee(state.db_conn, employee_id)
+    # ── Soft-delete in SQLite + queue deactivation event for central (atomic) ──
+    ts = datetime.now(timezone.utc).isoformat()
+    deactivation_payload = {
+        "store_id": state.store_id,
+        "device_id": state.device_id,
+        "timestamp": ts,
+        "employee_id": employee_id,
+    }
+    with state.db_conn:
+        state.db_conn.execute(
+            "UPDATE employees SET is_active = 0 WHERE id = ? AND is_active = 1",
+            (employee_id,),
+        )
+        _enqueue_outbox(state.db_conn, "deactivation", deactivation_payload, ts)
 
     # ── Delete photo file ──
     if photo_path:

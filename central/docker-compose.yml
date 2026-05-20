@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: fr-central-postgres
+    environment:
+      POSTGRES_USER: central
+      POSTGRES_PASSWORD: central
+      POSTGRES_DB: central
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - central_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U central -d central"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  central_pgdata:

@@ -17,3 +17,7 @@ scikit-image>=0.19.0
 fastapi>=0.100.0
 uvicorn[standard]>=0.22.0
 python-multipart>=0.0.6
+
+# Sync substrate — async HTTP client used by sync_worker.py to upload
+# outbox events to central HQ
+httpx>=0.25.0
