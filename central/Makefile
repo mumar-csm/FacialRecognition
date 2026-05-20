@@ -9,7 +9,7 @@ APP := app.main:app
 include .env
 export
 
-.PHONY: help db-up db-down db-logs db-reset migrate revision dev psql install
+.PHONY: help db-up db-down db-logs db-reset migrate revision dev psql install register-device
 
 help:
 	@echo "Targets:"
@@ -22,6 +22,8 @@ help:
 	@echo "  revision  - create a new migration (use: make revision MSG='add foo')"
 	@echo "  dev       - run the FastAPI app on $$HOST:$$PORT with autoreload"
 	@echo "  psql      - drop into psql against the local Postgres"
+	@echo "  register-device DEVICE=<id> STORE=<id>"
+	@echo "            - generate an API key and register a new kiosk device"
 
 install:
 	pip install -r requirements.txt
@@ -54,3 +56,10 @@ dev:
 
 psql:
 	docker exec -it fr-central-postgres psql -U central -d central
+
+register-device:
+	@if [ -z "$(DEVICE)" ] || [ -z "$(STORE)" ]; then \
+		echo "usage: make register-device DEVICE=<device-id> STORE=<store-id>"; \
+		exit 1; \
+	fi
+	python -m tools.register_device --device-id $(DEVICE) --store-id $(STORE)

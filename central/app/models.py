@@ -100,3 +100,27 @@ spoof_attempts = Table(
 )
 
 Index("idx_spoof_store_timestamp", spoof_attempts.c.store_id, spoof_attempts.c.timestamp)
+
+
+# Audit trail for events the batch endpoint accepted at the HTTP layer but
+# could not insert (store_id mismatch, unknown kind, malformed payload, etc.).
+# The kiosk treats a 2xx as "drop from outbox" so without this table those
+# events would only exist in stdout logs. Keeping it loose on purpose:
+# device_id has no FK to devices so we can later log auth failures here too,
+# and event_uuid is TEXT (not UUID) so malformed UUIDs are still capturable.
+sync_audit = Table(
+    "sync_audit",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("received_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("device_id", Text, nullable=False),
+    Column("store_id", Text),
+    Column("event_uuid", Text),
+    Column("kind", Text),
+    Column("reason", Text, nullable=False),
+    Column("payload_preview", Text),
+)
+
+Index("idx_sync_audit_received", sync_audit.c.received_at)
+Index("idx_sync_audit_device_received", sync_audit.c.device_id, sync_audit.c.received_at)
+Index("idx_sync_audit_reason_received", sync_audit.c.reason, sync_audit.c.received_at)
