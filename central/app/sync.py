@@ -136,6 +136,11 @@ async def _handle_enrollment(
     photo_bytes = base64.b64decode(photo_b64, validate=True) if photo_b64 else None
     enrolled_at = _ts(p["timestamp"])
 
+    # pos_employee_id is nullable on the column (pre-migration rows) but the
+    # kiosk requires it for new enrollments. Treat missing/empty as None here
+    # for forward-compat with any older kiosk payloads still in flight.
+    pos_employee_id = p.get("pos_employee_id") or None
+
     stmt = pg_insert(employees).values(
         id=p["employee_id"],
         store_id=p["store_id"],
@@ -146,6 +151,7 @@ async def _handle_enrollment(
         embedding_dim=int(p["embedding_dim"]),
         encoding=encoding_bytes,
         photo=photo_bytes,
+        pos_employee_id=pos_employee_id,
     )
     # Newer enrollment wins; equal-timestamp duplicate retries are no-ops
     # (avoids version churn). See conversation notes 2026-05-19.
@@ -159,6 +165,7 @@ async def _handle_enrollment(
             "embedding_dim": stmt.excluded.embedding_dim,
             "encoding": stmt.excluded.encoding,
             "photo": stmt.excluded.photo,
+            "pos_employee_id": stmt.excluded.pos_employee_id,
             "version": employees.c.version + 1,
             "updated_at": func.now(),
         },
