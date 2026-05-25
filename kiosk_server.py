@@ -75,12 +75,16 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
 
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS employees (
-            id          TEXT PRIMARY KEY,
-            name        TEXT NOT NULL,
-            enrolled_at TEXT NOT NULL,
-            photo_path  TEXT,
-            is_active   INTEGER NOT NULL DEFAULT 1,
-            store_id    TEXT NOT NULL DEFAULT 'store-01'
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL,
+            enrolled_at      TEXT NOT NULL,
+            photo_path       TEXT,
+            is_active        INTEGER NOT NULL DEFAULT 1,
+            store_id         TEXT NOT NULL DEFAULT 'store-01',
+            pos_employee_id  TEXT CHECK (
+                pos_employee_id IS NULL
+                OR pos_employee_id GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
+            )
         );
 
         CREATE TABLE IF NOT EXISTS attendance (
@@ -114,6 +118,16 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_attendance_employee  ON attendance(employee_id);
         CREATE INDEX IF NOT EXISTS idx_spoof_timestamp      ON spoof_attempts(timestamp);
         CREATE INDEX IF NOT EXISTS idx_outbox_unsent ON outbox(created_at) WHERE sent_at IS NULL;
+
+        -- Reject NULL pos_employee_id on new inserts. Pre-migration rows already
+        -- exist with NULL and are untouched (this is BEFORE INSERT, not UPDATE),
+        -- but every new employee must have a POS ID. Backstops the API regex.
+        CREATE TRIGGER IF NOT EXISTS trg_employees_pos_id_required_on_insert
+        BEFORE INSERT ON employees
+        WHEN NEW.pos_employee_id IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'pos_employee_id is required for new employees');
+        END;
     """)
 
     # Migration: add store_id to existing databases that predate this column
@@ -121,6 +135,22 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
         conn.execute("ALTER TABLE employees ADD COLUMN store_id TEXT NOT NULL DEFAULT 'store-01'")
     except sqlite3.OperationalError:
         pass  # column already exists
+
+    # Migration: add pos_employee_id (nullable so pre-existing rows don't fail).
+    # The /api/enroll endpoint requires it for new enrollments — see EnrollRequest.
+    try:
+        conn.execute("ALTER TABLE employees ADD COLUMN pos_employee_id TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # Partial unique index: two employees in the same store cannot share a POS
+    # ID (Oracle uses it as the employee identifier on punches). Multiple NULLs
+    # are fine — pre-migration rows aren't blocked.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uniq_employees_store_pos "
+        "ON employees(store_id, pos_employee_id) "
+        "WHERE pos_employee_id IS NOT NULL"
+    )
 
     conn.commit()
     return conn
@@ -277,12 +307,18 @@ def get_spoof_count_for_range(
 def get_active_employees(conn: sqlite3.Connection, store_id: str) -> List[Dict]:
     """Return all active enrolled employees for a given store."""
     rows = conn.execute(
-        "SELECT id, name, enrolled_at, photo_path FROM employees "
+        "SELECT id, name, enrolled_at, photo_path, pos_employee_id FROM employees "
         "WHERE is_active = 1 AND store_id = ? ORDER BY name",
         (store_id,),
     ).fetchall()
     return [
-        {"id": r[0], "name": r[1], "enrolled_at": r[2], "photo_path": r[3]}
+        {
+            "id": r[0],
+            "name": r[1],
+            "enrolled_at": r[2],
+            "photo_path": r[3],
+            "pos_employee_id": r[4],
+        }
         for r in rows
     ]
 
@@ -558,6 +594,7 @@ class EnrollRequest(BaseModel):
     image: str        # base64-encoded JPEG (with or without data URI prefix)
     first_name: str
     last_name: str
+    pos_employee_id: str   # Oracle POS employee identifier — used to map punches
     pin: Optional[str] = None  # manager PIN if server is PIN-protected
 
 
@@ -986,8 +1023,32 @@ async def enroll(request: Request, body: EnrollRequest):
     last = re.sub(r"\s+", "_", last)
     base_name = f"{first}_{last}"
 
-    # ── Resolve employee name (auto-suffix on collision) ──
+    # ── Validate POS employee ID ──
+    # Oracle Simphony tenants on this deployment issue 7-digit numeric IDs.
+    pos_id = body.pos_employee_id.strip()
+    if not re.fullmatch(r"\d{7}", pos_id):
+        return EnrollResponse(
+            status="error",
+            message="POS Employee ID must be exactly 7 digits.",
+        )
+
+    # Uniqueness within store — POS ID identifies the employee on Oracle punches,
+    # so two active employees can't share it. Soft-deleted rows are excluded so
+    # an inactive employee's old POS ID can be reused (or kept on re-enrollment
+    # of the same name, which overwrites the row by id below).
     conn = state.db_conn
+    pos_collision = conn.execute(
+        "SELECT id FROM employees "
+        "WHERE store_id = ? AND pos_employee_id = ? AND is_active = 1",
+        (state.store_id, pos_id),
+    ).fetchone()
+    if pos_collision:
+        return EnrollResponse(
+            status="error",
+            message=f"POS Employee ID '{pos_id}' is already in use by another employee.",
+        )
+
+    # ── Resolve employee name (auto-suffix on collision) ──
     inactive = conn.execute(
         "SELECT id FROM employees WHERE id = ? AND is_active = 0", (base_name,)
     ).fetchone()
@@ -1092,6 +1153,7 @@ async def enroll(request: Request, body: EnrollRequest):
         "timestamp": ts,
         "employee_id": employee_name,
         "display_name": f"{first} {last}",
+        "pos_employee_id": pos_id,
         "embedder_type": args.embedder,
         "embedding_dim": int(np.asarray(embedding).size),
         "encoding_b64": base64.b64encode(encoding_bytes).decode("ascii"),
@@ -1099,12 +1161,13 @@ async def enroll(request: Request, body: EnrollRequest):
     }
     with state.db_conn:
         state.db_conn.execute(
-            "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active, store_id) "
-            "VALUES (?, ?, ?, ?, 1, ?) "
+            "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active, store_id, pos_employee_id) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET "
             "is_active = 1, enrolled_at = excluded.enrolled_at, "
-            "photo_path = excluded.photo_path, store_id = excluded.store_id",
-            (employee_name, f"{first} {last}", ts, str(photo_file), state.store_id),
+            "photo_path = excluded.photo_path, store_id = excluded.store_id, "
+            "pos_employee_id = excluded.pos_employee_id",
+            (employee_name, f"{first} {last}", ts, str(photo_file), state.store_id, pos_id),
         )
         _enqueue_outbox(state.db_conn, "enrollment", enrollment_payload, ts)
 

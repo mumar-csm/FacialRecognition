@@ -8,6 +8,7 @@
   var enrollBtn = document.getElementById("enroll-btn");
   var firstNameInput = document.getElementById("first-name");
   var lastNameInput = document.getElementById("last-name");
+  var posIdInput = document.getElementById("pos-employee-id");
   var storeLabel = document.getElementById("store-label");
   var pinGate = document.getElementById("pin-gate");
   var pinGateInput = document.getElementById("pin-gate-input");
@@ -180,39 +181,59 @@
     return raw.replace(/[^a-zA-Z\s-]/g, "").trim().toLowerCase().replace(/\s+/g, "_");
   }
 
-  // ── Button state + name validation ──
+  // ── POS ID validation (mirrors server-side regex in kiosk_server.py) ──
+  var POS_ID_RE = /^\d{7}$/;
+  function isValidPosId(raw) {
+    return POS_ID_RE.test(raw);
+  }
+
+  // ── Button state + name/POS-ID validation ──
   function updateButtonState() {
     var rawFirst = firstNameInput.value.trim();
     var rawLast = lastNameInput.value.trim();
     var cleanFirst = sanitizeName(rawFirst);
     var cleanLast = sanitizeName(rawLast);
     var hasName = cleanFirst && cleanLast;
+    var rawPosId = posIdInput.value.trim();
+    var posIdOk = isValidPosId(rawPosId);
 
-    // Show hint if characters were stripped
+    // Build the hint: name + POS ID feedback, whichever applies.
+    var hintParts = [];
     if ((rawFirst && rawFirst !== cleanFirst.replace(/_/g, " ")) ||
         (rawLast && rawLast !== cleanLast.replace(/_/g, " "))) {
-      nameHint.textContent = "Letters, spaces, and hyphens only. Will save as: " + cleanFirst + "_" + cleanLast;
-      nameHint.className = "name-hint";
+      hintParts.push("Letters, spaces, and hyphens only. Will save as: " + cleanFirst + "_" + cleanLast);
     } else if (hasName) {
-      nameHint.textContent = "Will save as: " + cleanFirst + "_" + cleanLast;
+      hintParts.push("Will save as: " + cleanFirst + "_" + cleanLast);
+    }
+    if (rawPosId && !posIdOk) {
+      hintParts.push("POS Employee ID must be exactly 7 digits.");
+    }
+    if (hintParts.length) {
+      nameHint.textContent = hintParts.join(" — ");
       nameHint.className = "name-hint";
     } else {
       nameHint.className = "name-hint hidden";
     }
 
-    enrollBtn.disabled = !cameraReady || !lightingOk || !hasName;
+    enrollBtn.disabled = !cameraReady || !lightingOk || !hasName || !posIdOk;
   }
 
   firstNameInput.addEventListener("input", updateButtonState);
   lastNameInput.addEventListener("input", updateButtonState);
+  posIdInput.addEventListener("input", updateButtonState);
 
   // ── Enroll ──
   enrollBtn.addEventListener("click", async function () {
     var firstName = firstNameInput.value.trim();
     var lastName = lastNameInput.value.trim();
+    var posId = posIdInput.value.trim();
 
     if (!firstName || !lastName) {
       showResult({ icon: "\u26A0", name: "", action: "Enter first and last name", cardClass: "result-warning" });
+      return;
+    }
+    if (!isValidPosId(posId)) {
+      showResult({ icon: "\u26A0", name: "", action: "Enter a valid POS Employee ID", cardClass: "result-warning" });
       return;
     }
 
@@ -229,7 +250,13 @@
       var resp = await fetch("/api/enroll", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ image: base64Data, first_name: firstName, last_name: lastName, pin: pinValue }),
+        body: JSON.stringify({
+          image: base64Data,
+          first_name: firstName,
+          last_name: lastName,
+          pos_employee_id: posId,
+          pin: pinValue,
+        }),
       });
       var data = await resp.json();
       handleResult(data);
@@ -253,6 +280,7 @@
         });
         firstNameInput.value = "";
         lastNameInput.value = "";
+        posIdInput.value = "";
         setStatus("idle", "Ready \u2014 enter name and capture");
         break;
 

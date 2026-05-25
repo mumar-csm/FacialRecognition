@@ -9,6 +9,7 @@ No ORM mapping — Core tables only. Alembic imports `metadata` from this module
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -54,12 +55,29 @@ employees = Table(
     Column("embedding_dim", Integer, nullable=False),
     Column("encoding", LargeBinary, nullable=False),
     Column("photo", LargeBinary),
+    # Oracle POS employee identifier — used by the Oracle push worker to map
+    # attendance rows to Simphony employees. Nullable for rows enrolled before
+    # this column existed; new enrollments require it at the kiosk API layer.
+    Column("pos_employee_id", Text),
     Column("version", BigInteger, nullable=False, server_default="1"),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     PrimaryKeyConstraint("id", "store_id", name="pk_employees"),
+    CheckConstraint(
+        r"pos_employee_id IS NULL OR pos_employee_id ~ '^\d{7}$'",
+        name="ck_employees_pos_employee_id_format",
+    ),
 )
 
 Index("idx_employees_store_version", employees.c.store_id, employees.c.version)
+# Partial unique index: one POS ID per store. Multiple NULLs allowed so
+# pre-migration rows aren't constrained.
+Index(
+    "uniq_employees_store_pos",
+    employees.c.store_id,
+    employees.c.pos_employee_id,
+    unique=True,
+    postgresql_where=employees.c.pos_employee_id.isnot(None),
+)
 
 
 attendance = Table(

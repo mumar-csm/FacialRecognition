@@ -186,6 +186,10 @@
         <input type="text" id="first-name" placeholder="First Name" class="enroll-input" autocomplete="off" />
         <input type="text" id="last-name" placeholder="Last Name" class="enroll-input" autocomplete="off" />
       </div>
+      <div class="enroll-row">
+        <input type="text" id="pos-employee-id" placeholder="POS Employee ID (7 digits)" class="enroll-input"
+               autocomplete="off" minlength="7" maxlength="7" inputmode="numeric" pattern="\d{7}" />
+      </div>
       <div id="name-hint" class="name-hint hidden"></div>
       <button id="enroll-btn" class="enroll-btn" disabled>Capture &amp; Enroll</button>
     </div>
@@ -207,6 +211,6 @@
     </div>
   </div>
 
-  <script src="/static/enroll.js?v=3"></script>
+  <script src="/static/enroll.js?v=5"></script>
 </body>
 </html>

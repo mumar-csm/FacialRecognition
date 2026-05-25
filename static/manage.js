@@ -160,6 +160,15 @@
       idTd.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
       idTd.style.fontSize = "13px";
 
+      var posIdTd = document.createElement("td");
+      posIdTd.textContent = emp.pos_employee_id || "—";
+      posIdTd.style.color = emp.pos_employee_id ? "#e2e8f0" : "#64748b";
+      posIdTd.style.fontFamily = "ui-monospace, SFMono-Regular, Menlo, monospace";
+      posIdTd.style.fontSize = "13px";
+      if (!emp.pos_employee_id) {
+        posIdTd.title = "No POS ID on file (enrolled before this field existed). Delete + re-enroll to set one.";
+      }
+
       var dateTd = document.createElement("td");
       dateTd.textContent = fmtDate(emp.enrolled_at);
 
@@ -186,6 +195,7 @@
 
       tr.appendChild(nameTd);
       tr.appendChild(idTd);
+      tr.appendChild(posIdTd);
       tr.appendChild(dateTd);
       tr.appendChild(actionTd);
       tbody.appendChild(tr);
