@@ -11,14 +11,15 @@ Usage:
     checker = create_anti_spoof("minifas")
     is_real, score = checker.check(face_crop)   # True/False, confidence
 
-    checker = create_anti_spoof("none")         # no-op, always passes
-    is_real, score = checker.check(face_crop)   # True, 1.0
+    checker = create_anti_spoof("none")         # disabled — returns None
+    if checker is not None:
+        is_real, score = checker.check(face_crop)
 """
 
 from __future__ import annotations
 
 import os
-from typing import Protocol, Tuple
+from typing import Optional, Protocol, Tuple
 
 import cv2
 import numpy as np
@@ -48,17 +49,6 @@ class AntiSpoofChecker(Protocol):
             confidence is the model's certainty in [0, 1].
         """
         ...
-
-
-# ---------------------------------------------------------------------------
-# No-op checker (backward compatibility / testing)
-# ---------------------------------------------------------------------------
-
-class NoopChecker:
-    """Always returns (True, 1.0). Used when anti-spoofing is disabled."""
-
-    def check(self, face_image: np.ndarray) -> Tuple[bool, float]:
-        return True, 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +165,7 @@ class MiniFASChecker:
 # Factory
 # ---------------------------------------------------------------------------
 
-def create_anti_spoof(method: str = "none", **kwargs) -> AntiSpoofChecker:
+def create_anti_spoof(method: str = "none", **kwargs) -> Optional[AntiSpoofChecker]:
     """
     Instantiate an anti-spoof checker by name.
 
@@ -185,10 +175,11 @@ def create_anti_spoof(method: str = "none", **kwargs) -> AntiSpoofChecker:
                   MiniFASChecker: model_path (optional), threshold (optional)
 
     Returns:
-        An AntiSpoofChecker instance.
+        An AntiSpoofChecker instance, or None if method="none".
+        Callers must guard with `if checker is not None` before calling .check().
     """
     if method == "none":
-        return NoopChecker()
+        return None
 
     elif method == "minifas":
         return MiniFASChecker(**kwargs)
