@@ -28,6 +28,7 @@
   let verifying = false;
   let challenging = false;
   let recognizedAt = 0;
+  let inFlight = false;
 
   // ── Clock ──
   function updateClock() {
@@ -98,7 +99,8 @@
   }
 
   async function captureAndRecognize() {
-    if (paused) return;
+    if (paused || inFlight) return;
+    inFlight = true;
 
     // Draw current video frame to hidden canvas
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
@@ -117,6 +119,8 @@
       handleResult(data);
     } catch (err) {
       setStatus("error", "Server error: " + err.message);
+    } finally {
+      inFlight = false;
     }
   }
 
