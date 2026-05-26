@@ -794,6 +794,14 @@ async def get_report_csv(
 
 @app.post("/api/recognize")
 async def recognize(request: Request, body: RecognizeRequest):
+    start = time.perf_counter()
+    try:
+        return await _recognize_impl(request, body)
+    finally:
+        print(f"recognize took {(time.perf_counter() - start) * 1000:.1f} ms", flush=True)
+
+
+async def _recognize_impl(request: Request, body: RecognizeRequest):
     """Core recognition pipeline — decode, detect, anti-spoof, embed, match, log."""
     state = request.app.state
     camera_id = body.camera_id or state.camera_id
