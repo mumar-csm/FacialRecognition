@@ -177,6 +177,15 @@ async def _handle_enrollment(
 async def _handle_deactivation(
     session: AsyncSession, event: EventIn, auth: DeviceAuth
 ) -> None:
+    """Deactivate an employee AND erase their biometric.
+
+    Beyond flipping is_active, this wipes the encoding (face template) and photo
+    to NULL — mirroring the kiosk, which already removes the encoding from its
+    pkl and deletes the enrollment photo on delete. The row, display_name,
+    pos_employee_id and all attendance history are kept so payroll/audit reports
+    still resolve. A later re-enrollment (newer timestamp) restores a fresh
+    encoding via _handle_enrollment.
+    """
     p = event.payload
     incoming_ts = _ts(p["timestamp"])
     # Gate against stale events: incoming kiosk timestamp must be >= the last
@@ -199,6 +208,11 @@ async def _handle_deactivation(
         .where(employees.c.updated_at <= incoming_ts)
         .values(
             is_active=False,
+            # Erase the biometric: face template + enrollment photo gone, while
+            # the row and attendance history stay (encoding is nullable as of
+            # migration 0004; photo was already nullable).
+            encoding=None,
+            photo=None,
             updated_at=func.now(),
             version=employees.c.version + 1,
         )
