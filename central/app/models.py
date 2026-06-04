@@ -53,7 +53,11 @@ employees = Table(
     Column("is_active", Boolean, nullable=False, server_default="true"),
     Column("embedder_type", Text, nullable=False),
     Column("embedding_dim", Integer, nullable=False),
-    Column("encoding", LargeBinary, nullable=False),
+    # Biometric template. Nullable because a deactivation erases it (sets it to
+    # NULL) while retaining the row + attendance history — see migration 0004
+    # and sync._handle_deactivation. Enrollment always supplies a value, so the
+    # only path that leaves this NULL is a deliberate erasure.
+    Column("encoding", LargeBinary),
     Column("photo", LargeBinary),
     # Oracle POS employee identifier — used by the Oracle push worker to map
     # attendance rows to Simphony employees. Nullable for rows enrolled before

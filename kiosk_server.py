@@ -373,6 +373,50 @@ def save_encoding_to_pkl(db_path: str, embedding: np.ndarray, label: str) -> Non
     os.replace(tmp_path, db_path)
 
 
+def reconcile_recognition_state(
+    conn: sqlite3.Connection,
+    db_path: str,
+    known_encodings: list,
+    known_labels: list,
+) -> Tuple[list, list, int]:
+    """Heal pkl/in-memory drift against the SQLite source of truth at startup.
+
+    A delete records the soft-delete + central notification BEFORE it wipes the
+    pkl (see delete_employee). If the process dies in that window, the face is
+    still present in the pkl and the loaded in-memory lists even though the
+    employee row is already marked inactive. On startup we drop any recognition
+    entry whose employee is soft-deleted, so a crashed delete self-completes,
+    and we persist the heal back to the pkl so disk matches memory.
+
+    SQLite is authoritative here because the soft-delete is the durable record
+    of intent; the pkl is only the recognition substrate. Returns the
+    (possibly filtered) (encodings, labels) and the count of entries removed.
+    """
+    inactive = {
+        r[0] for r in conn.execute("SELECT id FROM employees WHERE is_active = 0")
+    }
+    stale = inactive.intersection(known_labels)
+    if not stale:
+        return known_encodings, known_labels, 0
+
+    # Persist the heal first (best-effort): drop each stale label from the pkl
+    # so the reclaimed biometric doesn't linger on disk. A failure here is
+    # non-fatal — the in-memory filter below still takes effect this run, and
+    # the next startup will retry the pkl rewrite.
+    for label in stale:
+        try:
+            remove_encoding_from_pkl(db_path, label)
+        except Exception as e:
+            print(f"[STARTUP] WARN: could not purge '{label}' from pkl during reconcile: {e}")
+
+    pairs = [(e, l) for e, l in zip(known_encodings, known_labels) if l not in stale]
+    if pairs:
+        known_encodings, known_labels = map(list, zip(*pairs))
+    else:
+        known_encodings, known_labels = [], []
+    return known_encodings, known_labels, len(stale)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # CLI argument parsing
 # ═══════════════════════════════════════════════════════════════════════
@@ -514,13 +558,21 @@ async def lifespan(app: FastAPI):
     )
     app.state.do_align = (args.detector == "retinaface")
 
-    # Face encodings
+    # Face encodings + SQLite. Open the DB before binding the in-memory lists:
+    # SQLite is the source of truth for who's deleted, so we reconcile the pkl
+    # against it first (heals a delete that crashed before its pkl wipe).
     encodings, labels = load_database(args.database, expected_embedder=args.embedder)
+    app.state.db_conn = init_kiosk_db(args.sqlite)
+
+    encodings, labels, healed = reconcile_recognition_state(
+        app.state.db_conn, args.database, encodings, labels
+    )
+    if healed:
+        print(f"[STARTUP] Reconciled {healed} stale recognition "
+              f"entr{'y' if healed == 1 else 'ies'} against soft-deleted employees")
     app.state.known_encodings = encodings
     app.state.known_labels = labels
 
-    # SQLite
-    app.state.db_conn = init_kiosk_db(args.sqlite)
     att_del, spoof_del = purge_old_records(
         app.state.db_conn, args.retention_days, args.spoof_retention_days
     )
@@ -1189,59 +1241,84 @@ async def enroll(request: Request, body: EnrollRequest):
 
 @app.delete("/api/enroll/{employee_id}")
 async def delete_employee(request: Request, employee_id: str, pin: Optional[str] = Query(default=None)):
-    """Remove an employee from recognition and mark as inactive."""
+    """Remove an employee from recognition and mark as inactive.
+
+    Failure-aware ordering. The durable record of intent — the SQLite
+    soft-delete plus the `deactivation` outbox event that notifies central — is
+    committed FIRST, before the irreversible pkl wipe. So if the process dies
+    mid-delete, the worst residual is "row inactive + central notified, but face
+    still in the pkl", which is self-healed on next startup by
+    reconcile_recognition_state() and also fixable by simply retrying this call.
+    The old order (pkl wipe first) could strand the system as "face gone but row
+    still active and central never told" — a silent, unrecoverable drift.
+
+    Idempotent: an already-inactive row skips the soft-delete/outbox step (no
+    double-notify) but still re-runs the pkl/in-memory/photo cleanup, so a retry
+    completes a delete that previously failed after the soft-delete commit.
+    """
     state = request.app.state
 
     # ── PIN check ──
     if state.enrollment_pin and pin != state.enrollment_pin:
         return {"status": "unauthorized", "message": "Invalid PIN.", "employee_id": employee_id}
 
-    # ── Check exists and is active ──
+    # ── Look up the row regardless of is_active, so a retry can finish a
+    #    partially-applied delete (an active-only filter would 404 the retry). ──
     row = state.db_conn.execute(
-        "SELECT photo_path FROM employees WHERE id = ? AND is_active = 1",
+        "SELECT photo_path, is_active FROM employees WHERE id = ?",
         (employee_id,),
     ).fetchone()
     if row is None:
-        return {"status": "not_found", "message": f"No active employee found with id '{employee_id}'.", "employee_id": employee_id}
+        return {"status": "not_found", "message": f"No employee found with id '{employee_id}'.", "employee_id": employee_id}
 
-    photo_path = row[0]
+    photo_path, is_active = row[0], row[1]
 
-    # ── Remove from pkl (before in-memory — safer ordering) ──
+    # ── 1. Durable intent FIRST: soft-delete + queue deactivation (one txn). ──
+    #    Only on the active→inactive transition, so retries don't churn the
+    #    outbox or double-notify central. Nothing irreversible has happened yet,
+    #    so a failure here is safe to bail on and retry.
+    if is_active:
+        ts = datetime.now(timezone.utc).isoformat()
+        deactivation_payload = {
+            "store_id": state.store_id,
+            "device_id": state.device_id,
+            "timestamp": ts,
+            "employee_id": employee_id,
+        }
+        try:
+            with state.db_conn:
+                state.db_conn.execute(
+                    "UPDATE employees SET is_active = 0 WHERE id = ? AND is_active = 1",
+                    (employee_id,),
+                )
+                _enqueue_outbox(state.db_conn, "deactivation", deactivation_payload, ts)
+        except Exception as e:
+            return {"status": "error", "message": f"Failed to record deletion: {e}", "employee_id": employee_id}
+
+    # ── 2. Irreversible pkl wipe (persists the removal across restart). ──
+    #    If this throws, the row is already inactive and central is queued; the
+    #    residual face in the pkl is healed by reconcile on next startup or by
+    #    retrying this endpoint.
     try:
         remove_encoding_from_pkl(args.database, employee_id)
     except Exception as e:
-        return {"status": "error", "message": f"Failed to update encoding database: {e}", "employee_id": employee_id}
+        return {"status": "error", "message": f"Marked inactive, but failed to update encoding database — retry to finish: {e}", "employee_id": employee_id}
 
-    # ── Hot-reload in-memory: filter both parallel lists ──
+    # ── 3. Stop runtime recognition now: filter the in-memory lists. ──
     pairs = [(enc, lbl) for enc, lbl in zip(state.known_encodings, state.known_labels) if lbl != employee_id]
     if pairs:
         state.known_encodings, state.known_labels = map(list, zip(*pairs))
     else:
         state.known_encodings, state.known_labels = [], []
 
-    # ── Soft-delete in SQLite + queue deactivation event for central (atomic) ──
-    ts = datetime.now(timezone.utc).isoformat()
-    deactivation_payload = {
-        "store_id": state.store_id,
-        "device_id": state.device_id,
-        "timestamp": ts,
-        "employee_id": employee_id,
-    }
-    with state.db_conn:
-        state.db_conn.execute(
-            "UPDATE employees SET is_active = 0 WHERE id = ? AND is_active = 1",
-            (employee_id,),
-        )
-        _enqueue_outbox(state.db_conn, "deactivation", deactivation_payload, ts)
-
-    # ── Delete photo file ──
+    # ── 4. Delete photo file (non-fatal — record is already deactivated). ──
     if photo_path:
         try:
             Path(photo_path).unlink(missing_ok=True)
         except Exception:
-            pass  # Non-fatal — record is already deactivated
+            pass
 
-    # ── Clear in-memory state for this identity ──
+    # ── 5. Clear in-memory state for this identity. ──
     state.cooldown.pop(employee_id, None)
     state.pending.pop(employee_id, None)
 
