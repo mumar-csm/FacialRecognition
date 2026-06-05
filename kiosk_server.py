@@ -72,6 +72,12 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Enforce the attendance->employees foreign key. SQLite defaults this OFF
+    # per-connection, which left the FK declared-but-decorative. Safe here: the
+    # kiosk only ever soft-deletes employees (the row stays), and reconcile keeps
+    # known faces aligned to active employee rows, so no clock-in can reference a
+    # missing employee.
+    conn.execute("PRAGMA foreign_keys=ON")
 
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS employees (
@@ -381,26 +387,31 @@ def reconcile_recognition_state(
 ) -> Tuple[list, list, int]:
     """Heal pkl/in-memory drift against the SQLite source of truth at startup.
 
-    A delete records the soft-delete + central notification BEFORE it wipes the
-    pkl (see delete_employee). If the process dies in that window, the face is
-    still present in the pkl and the loaded in-memory lists even though the
-    employee row is already marked inactive. On startup we drop any recognition
-    entry whose employee is soft-deleted, so a crashed delete self-completes,
-    and we persist the heal back to the pkl so disk matches memory.
+    Enforces one invariant: a recognizable face must map to an *active* employee
+    row. Any loaded recognition entry whose label is not an active employee gets
+    dropped from the in-memory lists and purged from the pkl. This covers two
+    drift sources:
+      - soft-deleted employees still in the pkl — a delete records the
+        soft-delete + central notification BEFORE wiping the pkl (see
+        delete_employee), so a crash in that window leaves the face behind; and
+      - fully-orphaned labels with no employee row at all (e.g. an enrollment
+        that wrote the pkl but failed before the SQLite insert). Leaving these
+        would let a clock-in reference a missing employee and trip the
+        attendance->employees foreign key now that it's enforced.
 
-    SQLite is authoritative here because the soft-delete is the durable record
-    of intent; the pkl is only the recognition substrate. Returns the
-    (possibly filtered) (encodings, labels) and the count of entries removed.
+    SQLite is authoritative because the employees table is the durable record;
+    the pkl is only the recognition substrate. Returns the (possibly filtered)
+    (encodings, labels) and the count of distinct labels removed.
     """
-    inactive = {
-        r[0] for r in conn.execute("SELECT id FROM employees WHERE is_active = 0")
+    active = {
+        r[0] for r in conn.execute("SELECT id FROM employees WHERE is_active = 1")
     }
-    stale = inactive.intersection(known_labels)
+    stale = {label for label in known_labels if label not in active}
     if not stale:
         return known_encodings, known_labels, 0
 
     # Persist the heal first (best-effort): drop each stale label from the pkl
-    # so the reclaimed biometric doesn't linger on disk. A failure here is
+    # so a reclaimed biometric doesn't linger on disk. A failure here is
     # non-fatal — the in-memory filter below still takes effect this run, and
     # the next startup will retry the pkl rewrite.
     for label in stale:
