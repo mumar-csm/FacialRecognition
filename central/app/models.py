@@ -146,3 +146,28 @@ sync_audit = Table(
 Index("idx_sync_audit_received", sync_audit.c.received_at)
 Index("idx_sync_audit_device_received", sync_audit.c.device_id, sync_audit.c.received_at)
 Index("idx_sync_audit_reason_received", sync_audit.c.reason, sync_audit.c.received_at)
+
+
+# Durable record of *applied* biometric erasures. Written by the deactivation
+# handler ONLY when the erasure actually lands (the UPDATE affected a row), so
+# redelivered/stale no-op events never create phantom audit entries. This is the
+# compliance trail: "employee X at store Y was erased, reported by device Z, at
+# time T". Named by the action (deletion) rather than the actor so HQ-initiated
+# deletes in Step 2b can write here too. Deliberately loose — no FK to employees
+# — so the audit survives even if the employee row is later hard-purged (#3).
+deletion_audit = Table(
+    "deletion_audit",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("erased_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    Column("device_id", Text, nullable=False),
+    Column("store_id", Text, nullable=False),
+    Column("employee_id", Text, nullable=False),
+    Column("event_uuid", Text, nullable=False),
+    # The kiosk-side timestamp from the deactivation event (when the delete was
+    # issued), distinct from erased_at (when central applied it).
+    Column("event_timestamp", DateTime(timezone=True), nullable=False),
+)
+
+Index("idx_deletion_audit_erased", deletion_audit.c.erased_at)
+Index("idx_deletion_audit_store_employee", deletion_audit.c.store_id, deletion_audit.c.employee_id)

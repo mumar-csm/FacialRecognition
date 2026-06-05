@@ -30,7 +30,7 @@ from sqlalchemy.sql import func
 
 from . import db
 from .auth import DeviceAuth, require_device
-from .models import attendance, employees, spoof_attempts, sync_audit
+from .models import attendance, deletion_audit, employees, spoof_attempts, sync_audit
 
 
 router = APIRouter()
@@ -201,7 +201,7 @@ async def _handle_deactivation(
     # Likelihood is low (NTP normally <1s drift, deactivations rarely follow
     # enrollments by seconds) and failure mode is recoverable (admin retries).
     # No-op (0 rows updated) is fine — naturally idempotent.
-    await session.execute(
+    result = await session.execute(
         update(employees)
         .where(employees.c.id == p["employee_id"])
         .where(employees.c.store_id == p["store_id"])
@@ -217,6 +217,21 @@ async def _handle_deactivation(
             version=employees.c.version + 1,
         )
     )
+
+    # Record the erasure ONLY when it actually applied. A stale/no-op redelivery
+    # (gate rejected it, or the employee isn't here) updates 0 rows and must not
+    # leave a phantom audit entry. Same transaction as the UPDATE (the caller
+    # opened it), so erasure and audit commit or roll back together.
+    if result.rowcount:
+        await session.execute(
+            deletion_audit.insert().values(
+                device_id=auth.device_id,
+                store_id=p["store_id"],
+                employee_id=p["employee_id"],
+                event_uuid=event.event_uuid,
+                event_timestamp=incoming_ts,
+            )
+        )
 
 
 HANDLERS = {
