@@ -131,6 +131,54 @@ class RetinaFaceDetector:
 
 
 # ---------------------------------------------------------------------------
+# SCRFD detector (InsightFace, direct model_zoo load — no auxiliary models)
+# ---------------------------------------------------------------------------
+
+class SCRFDDetector:
+    """
+    InsightFace SCRFD detector loaded directly via model_zoo.
+
+    The RetinaFaceDetector above goes through insightface.app.FaceAnalysis,
+    which runs every model in the pack (2d106det, 1k3d68, genderage) on every
+    frame even though we only need the 5-point landmarks the detector itself
+    produces. Loading via model_zoo skips that overhead — same detection
+    model, same accuracy, just no auxiliary pipeline.
+    """
+
+    def __init__(self, model_path: str,
+                 det_size: Tuple[int, int] = (320, 320),
+                 det_thresh: float = 0.5):
+        model_path = os.path.expanduser(model_path)
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"SCRFD model not found: {model_path}")
+
+        # Silence ONNX runtime "VerifyOutputSizes" warnings. The SCRFD ONNX was
+        # exported assuming 640x640 input; at 320x320 the actual output shapes
+        # are smaller than the metadata declares, which is harmless but floods
+        # stderr on every call. 3 = ERROR-only.
+        import onnxruntime as ort
+        ort.set_default_logger_severity(3)
+
+        from insightface.model_zoo import model_zoo  # lazy import
+        self._det = model_zoo.get_model(model_path)
+        # ctx_id=-1 → CPU, ctx_id=0 → GPU
+        self._det.prepare(ctx_id=-1, input_size=det_size, det_thresh=det_thresh)
+
+    def detect(self, image: np.ndarray) -> List[Tuple[Tuple[int, int, int, int], Optional[np.ndarray]]]:
+        """Detect faces with SCRFD. Returns (bbox, landmarks) per face."""
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        bboxes, kpss = self._det.detect(bgr, max_num=0, metric="default")
+
+        results = []
+        for i, bbox in enumerate(bboxes):
+            x1, y1, x2, y2 = bbox[:4]
+            box = (int(x1), int(y1), int(x2 - x1), int(y2 - y1))
+            landmarks = kpss[i] if kpss is not None else None
+            results.append((box, landmarks))
+        return results
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -139,10 +187,11 @@ def create_detector(detector_type: str, **kwargs) -> FaceDetector:
     Instantiate a face detector by name.
 
     Args:
-        detector_type: "haar" or "retinaface"
+        detector_type: "haar", "retinaface", or "scrfd"
         **kwargs: Passed to the detector constructor.
                   HaarDetector: cascade_path (required), params (optional)
                   RetinaFaceDetector: det_size (optional, default (640,640))
+                  SCRFDDetector: model_path (required), det_size, det_thresh
 
     Returns:
         A FaceDetector instance.
@@ -158,8 +207,16 @@ def create_detector(detector_type: str, **kwargs) -> FaceDetector:
         det_size = kwargs.get("det_size", (640, 640))
         return RetinaFaceDetector(det_size=det_size)
 
+    elif detector_type == "scrfd":
+        model_path = kwargs.get("model_path")
+        if not model_path:
+            raise ValueError("SCRFDDetector requires 'model_path' kwarg")
+        det_size = kwargs.get("det_size", (320, 320))
+        det_thresh = kwargs.get("det_thresh", 0.5)
+        return SCRFDDetector(model_path, det_size=det_size, det_thresh=det_thresh)
+
     else:
-        raise ValueError(f"Unknown detector type: '{detector_type}'. Choose 'haar' or 'retinaface'.")
+        raise ValueError(f"Unknown detector type: '{detector_type}'. Choose 'haar', 'retinaface', or 'scrfd'.")
 
 
 # ---------------------------------------------------------------------------

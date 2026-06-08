@@ -438,7 +438,14 @@ def parse_args():
                    help="Path to face encodings pkl file")
     p.add_argument("--sqlite", default="data/kiosk.db",
                    help="Path to SQLite database")
-    p.add_argument("--detector", choices=["haar", "retinaface"], default="retinaface")
+    p.add_argument("--detector", choices=["haar", "retinaface", "scrfd"], default="retinaface")
+    p.add_argument("--scrfd-model",
+                   default="~/.insightface/models/buffalo_l/det_10g.onnx",
+                   dest="scrfd_model",
+                   help="Path to SCRFD ONNX model (used when --detector scrfd). "
+                        "Defaults to the det_10g.onnx already downloaded by buffalo_l.")
+    p.add_argument("--det-size", type=int, default=320, dest="det_size",
+                   help="Detector input size (square). Smaller = faster, less accurate.")
     p.add_argument("--embedder", choices=["dlib", "arcface"], default="arcface")
     p.add_argument("--anti-spoof", choices=["none", "minifas"], default="minifas",
                    dest="anti_spoof")
@@ -561,13 +568,26 @@ async def lifespan(app: FastAPI):
         sys.exit(1)
 
     # ML pipeline
-    app.state.detector = create_detector(args.detector)
+    if args.detector == "scrfd":
+        app.state.detector = create_detector(
+            "scrfd",
+            model_path=args.scrfd_model,
+            det_size=(args.det_size, args.det_size),
+        )
+    elif args.detector == "retinaface":
+        app.state.detector = create_detector(
+            "retinaface",
+            det_size=(args.det_size, args.det_size),
+        )
+    else:
+        app.state.detector = create_detector(args.detector)
     app.state.embedder = create_embedder(args.embedder)
     app.state.anti_spoof = create_anti_spoof(
         args.anti_spoof,
         **({"threshold": args.spoof_threshold} if args.anti_spoof != "none" else {}),
     )
-    app.state.do_align = (args.detector == "retinaface")
+    # SCRFD and RetinaFace both produce 5-point landmarks usable for alignment.
+    app.state.do_align = args.detector in ("retinaface", "scrfd")
 
     # Face encodings + SQLite. Open the DB before binding the in-memory lists:
     # SQLite is the source of truth for who's deleted, so we reconcile the pkl
@@ -858,19 +878,24 @@ async def get_report_csv(
 @app.post("/api/recognize")
 async def recognize(request: Request, body: RecognizeRequest):
     start = time.perf_counter()
+    timings: Dict[str, float] = {}
     try:
-        return await _recognize_impl(request, body)
+        return await _recognize_impl(request, body, timings)
     finally:
-        print(f"recognize took {(time.perf_counter() - start) * 1000:.1f} ms", flush=True)
+        total = (time.perf_counter() - start) * 1000
+        stages = " ".join(f"{k}={v:.0f}" for k, v in timings.items())
+        print(f"recognize took {total:.1f} ms [{stages}]", flush=True)
 
 
-async def _recognize_impl(request: Request, body: RecognizeRequest):
+async def _recognize_impl(request: Request, body: RecognizeRequest,
+                          timings: Dict[str, float]):
     """Core recognition pipeline — decode, detect, anti-spoof, embed, match, log."""
     state = request.app.state
     camera_id = body.camera_id or state.camera_id
     state.liveness.cleanup_stale()
 
     # ── Step 1: Decode base64 → BGR → RGB ──
+    _t = time.perf_counter()
     try:
         image_data = body.image
         # Strip data URI prefix if present
@@ -884,9 +909,12 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     except Exception as e:
         return RecognizeResponse(status="error", message=f"Image decode failed: {e}")
+    timings["decode"] = (time.perf_counter() - _t) * 1000
 
     # ── Step 2: Detect faces ──
+    _t = time.perf_counter()
     detections = state.detector.detect(frame_rgb)
+    timings["detect"] = (time.perf_counter() - _t) * 1000
 
     # ── Step 3: Reject 0 or >1 faces ──
     if len(detections) == 0:
@@ -908,9 +936,11 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
         # Use the session's most recent distance as a placeholder for logging
         prior_distances = state.liveness.sessions[active_identity].distances
         placeholder_dist = prior_distances[-1] if prior_distances else 0.0
+        _t = time.perf_counter()
         liveness_state, info = state.liveness.process_frame(
             active_identity, landmarks, frame_rgb, placeholder_dist
         )
+        timings["fastpath"] = (time.perf_counter() - _t) * 1000
 
         if liveness_state == SessionState.CHALLENGE_ACTIVE:
             return RecognizeResponse(
@@ -965,7 +995,9 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
     if state.anti_spoof is not None and not state.liveness.sessions:
         face_crop = frame_rgb[y:y+h, x:x+w]
         if face_crop.size > 0:
+            _t = time.perf_counter()
             is_real, spoof_score = state.anti_spoof.check(face_crop)
+            timings["spoof"] = (time.perf_counter() - _t) * 1000
             print(f"[ANTI-SPOOF] is_real={is_real}, score={spoof_score:.4f}")
             if not is_real:
                 # Debounce: a single borderline dip shouldn't kill consensus.
@@ -990,25 +1022,31 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
                 state.spoof_streak = 0
 
     # ── Step 5: Align face ──
+    _t = time.perf_counter()
     if state.do_align and landmarks is not None:
         aligned = align_face(frame_rgb, landmarks, 112)
         aligned = np.ascontiguousarray(aligned)
     else:
         face_roi = frame_rgb[y:y+h, x:x+w]
         aligned = np.ascontiguousarray(face_roi) if face_roi.size > 0 else None
+    timings["align"] = (time.perf_counter() - _t) * 1000
 
     if aligned is None:
         return RecognizeResponse(status="error", message="Face alignment failed")
 
     # ── Step 6: Embed ──
+    _t = time.perf_counter()
     embedding = state.embedder.embed(aligned)
+    timings["embed"] = (time.perf_counter() - _t) * 1000
     if embedding is None:
         return RecognizeResponse(status="error", message="Embedding extraction failed")
 
     # ── Step 7: Match ──
+    _t = time.perf_counter()
     label, distance, confidence = find_best_match(
         embedding, state.known_encodings, state.known_labels, state.threshold
     )
+    timings["match"] = (time.perf_counter() - _t) * 1000
     if label == "Unknown":
         state.pending.clear()
         return RecognizeResponse(
