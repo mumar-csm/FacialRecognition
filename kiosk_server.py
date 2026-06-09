@@ -120,10 +120,25 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
             last_error    TEXT
         );
 
+        -- Admin-facing notifications. Early stage of an alerting system: events
+        -- worth a manager's attention (e.g. someone enrolling a face that is
+        -- already an active employee). For now these are written here and echoed
+        -- to stdout; a future admin UI / push channel reads from this table.
+        CREATE TABLE IF NOT EXISTS notifications (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp     TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            severity      TEXT NOT NULL DEFAULT 'warning',
+            message       TEXT NOT NULL,
+            payload_json  TEXT,
+            acknowledged  INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_attendance_timestamp ON attendance(timestamp);
         CREATE INDEX IF NOT EXISTS idx_attendance_employee  ON attendance(employee_id);
         CREATE INDEX IF NOT EXISTS idx_spoof_timestamp      ON spoof_attempts(timestamp);
         CREATE INDEX IF NOT EXISTS idx_outbox_unsent ON outbox(created_at) WHERE sent_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_notifications_unack ON notifications(timestamp) WHERE acknowledged = 0;
 
         -- Reject NULL pos_employee_id on new inserts. Pre-migration rows already
         -- exist with NULL and are untouched (this is BEFORE INSERT, not UPDATE),
@@ -174,6 +189,39 @@ def _enqueue_outbox(conn: sqlite3.Connection, kind: str,
         (event_uuid, kind, json.dumps(payload, separators=(",", ":")), created_at),
     )
     return event_uuid
+
+
+def _record_notification(conn: sqlite3.Connection, kind: str, message: str,
+                         severity: str = "warning",
+                         payload: Optional[Dict[str, Any]] = None) -> int:
+    """Record an admin-facing notification and emit it to stdout.
+
+    This is the first stage of the alerting pipeline: events land in the
+    `notifications` table (for a future admin UI / push channel to drain) and
+    are echoed to the terminal now so operators see them immediately. Safe to
+    call inside or outside an open transaction.
+
+    Returns the inserted notification row ID.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    payload_json = json.dumps(payload, separators=(",", ":")) if payload else None
+
+    # Stdout alert — boxed so it stands out in the server log.
+    banner = f"  [{severity.upper()}] {kind}: {message}"
+    print("\n" + "!" * 72, flush=True)
+    print("!! ADMIN NOTIFICATION", flush=True)
+    print(banner, flush=True)
+    if payload:
+        print(f"  detail: {payload_json}", flush=True)
+    print("!" * 72 + "\n", flush=True)
+
+    cur = conn.execute(
+        "INSERT INTO notifications (timestamp, kind, severity, message, payload_json) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (ts, kind, severity, message, payload_json),
+    )
+    conn.commit()
+    return cur.lastrowid
 
 
 def log_attendance(conn: sqlite3.Connection, employee_id: str,
@@ -682,7 +730,7 @@ class EnrollRequest(BaseModel):
 
 
 class EnrollResponse(BaseModel):
-    status: str  # enrolled, unauthorized, no_face, multiple_faces, spoof_detected, error
+    status: str  # enrolled, unauthorized, no_face, multiple_faces, spoof_detected, duplicate_face, error
     message: str = ""
     employee_name: str = ""  # stored as firstname_lastname (or firstname_lastname_2 on collision)
 
@@ -1234,6 +1282,57 @@ async def enroll(request: Request, body: EnrollRequest):
     embedding = state.embedder.embed(aligned)
     if embedding is None:
         return EnrollResponse(status="error", message="Embedding extraction failed.", employee_name=employee_name)
+
+    # ── Duplicate-face guard ──
+    # Reject enrolling a face that already belongs to a different active
+    # employee. Without this, the same person could be registered under two POS
+    # IDs / names (buddy fraud, or accidental double-enrollment), since the only
+    # other uniqueness checks are on metadata, not the biometric itself.
+    #
+    # We match against the same in-memory encodings the recognizer uses (which
+    # reconcile keeps aligned to active employees), excluding the label we're
+    # about to write so a legitimate re-enrollment of a soft-deleted person
+    # can't trip on a stale copy of their own face. Same threshold as live
+    # recognition: if this face would be recognized as someone, it's a dup.
+    dup_encodings = [
+        e for e, l in zip(state.known_encodings, state.known_labels) if l != employee_name
+    ]
+    dup_labels = [l for l in state.known_labels if l != employee_name]
+    match_label, match_dist, _ = find_best_match(
+        np.asarray(embedding), dup_encodings, dup_labels, state.threshold
+    )
+    if match_label != "Unknown":
+        existing = state.db_conn.execute(
+            "SELECT name, pos_employee_id FROM employees WHERE id = ? AND is_active = 1",
+            (match_label,),
+        ).fetchone()
+        existing_name = existing[0] if existing else match_label
+        existing_pos = existing[1] if existing else None
+        _record_notification(
+            state.db_conn,
+            kind="duplicate_face_enrollment",
+            severity="alert",
+            message=(
+                f"Enrollment blocked: the captured face already belongs to active "
+                f"employee '{existing_name}' (id={match_label}). Attempted to enroll "
+                f"as '{first} {last}' (POS {pos_id})."
+            ),
+            payload={
+                "store_id": state.store_id,
+                "device_id": state.device_id,
+                "existing_employee_id": match_label,
+                "existing_employee_name": existing_name,
+                "existing_pos_employee_id": existing_pos,
+                "attempted_name": f"{first} {last}",
+                "attempted_pos_employee_id": pos_id,
+                "match_distance": round(float(match_dist), 4),
+            },
+        )
+        return EnrollResponse(
+            status="duplicate_face",
+            message=f"This face is already enrolled as {existing_name}.",
+            employee_name=employee_name,
+        )
 
     # ── Persist to pkl (before in-memory and photo — safer ordering) ──
     try:
