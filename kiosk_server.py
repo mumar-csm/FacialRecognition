@@ -120,10 +120,25 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
             last_error    TEXT
         );
 
+        -- Admin-facing notifications. Early stage of an alerting system: events
+        -- worth a manager's attention (e.g. someone enrolling a face that is
+        -- already an active employee). For now these are written here and echoed
+        -- to stdout; a future admin UI / push channel reads from this table.
+        CREATE TABLE IF NOT EXISTS notifications (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp     TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            severity      TEXT NOT NULL DEFAULT 'warning',
+            message       TEXT NOT NULL,
+            payload_json  TEXT,
+            acknowledged  INTEGER NOT NULL DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_attendance_timestamp ON attendance(timestamp);
         CREATE INDEX IF NOT EXISTS idx_attendance_employee  ON attendance(employee_id);
         CREATE INDEX IF NOT EXISTS idx_spoof_timestamp      ON spoof_attempts(timestamp);
         CREATE INDEX IF NOT EXISTS idx_outbox_unsent ON outbox(created_at) WHERE sent_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_notifications_unack ON notifications(timestamp) WHERE acknowledged = 0;
 
         -- Reject NULL pos_employee_id on new inserts. Pre-migration rows already
         -- exist with NULL and are untouched (this is BEFORE INSERT, not UPDATE),
@@ -174,6 +189,39 @@ def _enqueue_outbox(conn: sqlite3.Connection, kind: str,
         (event_uuid, kind, json.dumps(payload, separators=(",", ":")), created_at),
     )
     return event_uuid
+
+
+def _record_notification(conn: sqlite3.Connection, kind: str, message: str,
+                         severity: str = "warning",
+                         payload: Optional[Dict[str, Any]] = None) -> int:
+    """Record an admin-facing notification and emit it to stdout.
+
+    This is the first stage of the alerting pipeline: events land in the
+    `notifications` table (for a future admin UI / push channel to drain) and
+    are echoed to the terminal now so operators see them immediately. Safe to
+    call inside or outside an open transaction.
+
+    Returns the inserted notification row ID.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    payload_json = json.dumps(payload, separators=(",", ":")) if payload else None
+
+    # Stdout alert — boxed so it stands out in the server log.
+    banner = f"  [{severity.upper()}] {kind}: {message}"
+    print("\n" + "!" * 72, flush=True)
+    print("!! ADMIN NOTIFICATION", flush=True)
+    print(banner, flush=True)
+    if payload:
+        print(f"  detail: {payload_json}", flush=True)
+    print("!" * 72 + "\n", flush=True)
+
+    cur = conn.execute(
+        "INSERT INTO notifications (timestamp, kind, severity, message, payload_json) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (ts, kind, severity, message, payload_json),
+    )
+    conn.commit()
+    return cur.lastrowid
 
 
 def log_attendance(conn: sqlite3.Connection, employee_id: str,
@@ -438,7 +486,14 @@ def parse_args():
                    help="Path to face encodings pkl file")
     p.add_argument("--sqlite", default="data/kiosk.db",
                    help="Path to SQLite database")
-    p.add_argument("--detector", choices=["haar", "retinaface"], default="retinaface")
+    p.add_argument("--detector", choices=["haar", "retinaface", "scrfd"], default="retinaface")
+    p.add_argument("--scrfd-model",
+                   default="~/.insightface/models/buffalo_l/det_10g.onnx",
+                   dest="scrfd_model",
+                   help="Path to SCRFD ONNX model (used when --detector scrfd). "
+                        "Defaults to the det_10g.onnx already downloaded by buffalo_l.")
+    p.add_argument("--det-size", type=int, default=320, dest="det_size",
+                   help="Detector input size (square). Smaller = faster, less accurate.")
     p.add_argument("--embedder", choices=["dlib", "arcface"], default="arcface")
     p.add_argument("--anti-spoof", choices=["none", "minifas"], default="minifas",
                    dest="anti_spoof")
@@ -561,13 +616,26 @@ async def lifespan(app: FastAPI):
         sys.exit(1)
 
     # ML pipeline
-    app.state.detector = create_detector(args.detector)
+    if args.detector == "scrfd":
+        app.state.detector = create_detector(
+            "scrfd",
+            model_path=args.scrfd_model,
+            det_size=(args.det_size, args.det_size),
+        )
+    elif args.detector == "retinaface":
+        app.state.detector = create_detector(
+            "retinaface",
+            det_size=(args.det_size, args.det_size),
+        )
+    else:
+        app.state.detector = create_detector(args.detector)
     app.state.embedder = create_embedder(args.embedder)
     app.state.anti_spoof = create_anti_spoof(
         args.anti_spoof,
         **({"threshold": args.spoof_threshold} if args.anti_spoof != "none" else {}),
     )
-    app.state.do_align = (args.detector == "retinaface")
+    # SCRFD and RetinaFace both produce 5-point landmarks usable for alignment.
+    app.state.do_align = args.detector in ("retinaface", "scrfd")
 
     # Face encodings + SQLite. Open the DB before binding the in-memory lists:
     # SQLite is the source of truth for who's deleted, so we reconcile the pkl
@@ -662,7 +730,7 @@ class EnrollRequest(BaseModel):
 
 
 class EnrollResponse(BaseModel):
-    status: str  # enrolled, unauthorized, no_face, multiple_faces, spoof_detected, error
+    status: str  # enrolled, unauthorized, no_face, multiple_faces, spoof_detected, duplicate_face, error
     message: str = ""
     employee_name: str = ""  # stored as firstname_lastname (or firstname_lastname_2 on collision)
 
@@ -858,19 +926,24 @@ async def get_report_csv(
 @app.post("/api/recognize")
 async def recognize(request: Request, body: RecognizeRequest):
     start = time.perf_counter()
+    timings: Dict[str, float] = {}
     try:
-        return await _recognize_impl(request, body)
+        return await _recognize_impl(request, body, timings)
     finally:
-        print(f"recognize took {(time.perf_counter() - start) * 1000:.1f} ms", flush=True)
+        total = (time.perf_counter() - start) * 1000
+        stages = " ".join(f"{k}={v:.0f}" for k, v in timings.items())
+        print(f"recognize took {total:.1f} ms [{stages}]", flush=True)
 
 
-async def _recognize_impl(request: Request, body: RecognizeRequest):
+async def _recognize_impl(request: Request, body: RecognizeRequest,
+                          timings: Dict[str, float]):
     """Core recognition pipeline — decode, detect, anti-spoof, embed, match, log."""
     state = request.app.state
     camera_id = body.camera_id or state.camera_id
     state.liveness.cleanup_stale()
 
     # ── Step 1: Decode base64 → BGR → RGB ──
+    _t = time.perf_counter()
     try:
         image_data = body.image
         # Strip data URI prefix if present
@@ -884,9 +957,12 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     except Exception as e:
         return RecognizeResponse(status="error", message=f"Image decode failed: {e}")
+    timings["decode"] = (time.perf_counter() - _t) * 1000
 
     # ── Step 2: Detect faces ──
+    _t = time.perf_counter()
     detections = state.detector.detect(frame_rgb)
+    timings["detect"] = (time.perf_counter() - _t) * 1000
 
     # ── Step 3: Reject 0 or >1 faces ──
     if len(detections) == 0:
@@ -908,9 +984,11 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
         # Use the session's most recent distance as a placeholder for logging
         prior_distances = state.liveness.sessions[active_identity].distances
         placeholder_dist = prior_distances[-1] if prior_distances else 0.0
+        _t = time.perf_counter()
         liveness_state, info = state.liveness.process_frame(
             active_identity, landmarks, frame_rgb, placeholder_dist
         )
+        timings["fastpath"] = (time.perf_counter() - _t) * 1000
 
         if liveness_state == SessionState.CHALLENGE_ACTIVE:
             return RecognizeResponse(
@@ -965,7 +1043,9 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
     if state.anti_spoof is not None and not state.liveness.sessions:
         face_crop = frame_rgb[y:y+h, x:x+w]
         if face_crop.size > 0:
+            _t = time.perf_counter()
             is_real, spoof_score = state.anti_spoof.check(face_crop)
+            timings["spoof"] = (time.perf_counter() - _t) * 1000
             print(f"[ANTI-SPOOF] is_real={is_real}, score={spoof_score:.4f}")
             if not is_real:
                 # Debounce: a single borderline dip shouldn't kill consensus.
@@ -990,25 +1070,31 @@ async def _recognize_impl(request: Request, body: RecognizeRequest):
                 state.spoof_streak = 0
 
     # ── Step 5: Align face ──
+    _t = time.perf_counter()
     if state.do_align and landmarks is not None:
         aligned = align_face(frame_rgb, landmarks, 112)
         aligned = np.ascontiguousarray(aligned)
     else:
         face_roi = frame_rgb[y:y+h, x:x+w]
         aligned = np.ascontiguousarray(face_roi) if face_roi.size > 0 else None
+    timings["align"] = (time.perf_counter() - _t) * 1000
 
     if aligned is None:
         return RecognizeResponse(status="error", message="Face alignment failed")
 
     # ── Step 6: Embed ──
+    _t = time.perf_counter()
     embedding = state.embedder.embed(aligned)
+    timings["embed"] = (time.perf_counter() - _t) * 1000
     if embedding is None:
         return RecognizeResponse(status="error", message="Embedding extraction failed")
 
     # ── Step 7: Match ──
+    _t = time.perf_counter()
     label, distance, confidence = find_best_match(
         embedding, state.known_encodings, state.known_labels, state.threshold
     )
+    timings["match"] = (time.perf_counter() - _t) * 1000
     if label == "Unknown":
         state.pending.clear()
         return RecognizeResponse(
@@ -1196,6 +1282,57 @@ async def enroll(request: Request, body: EnrollRequest):
     embedding = state.embedder.embed(aligned)
     if embedding is None:
         return EnrollResponse(status="error", message="Embedding extraction failed.", employee_name=employee_name)
+
+    # ── Duplicate-face guard ──
+    # Reject enrolling a face that already belongs to a different active
+    # employee. Without this, the same person could be registered under two POS
+    # IDs / names (buddy fraud, or accidental double-enrollment), since the only
+    # other uniqueness checks are on metadata, not the biometric itself.
+    #
+    # We match against the same in-memory encodings the recognizer uses (which
+    # reconcile keeps aligned to active employees), excluding the label we're
+    # about to write so a legitimate re-enrollment of a soft-deleted person
+    # can't trip on a stale copy of their own face. Same threshold as live
+    # recognition: if this face would be recognized as someone, it's a dup.
+    dup_encodings = [
+        e for e, l in zip(state.known_encodings, state.known_labels) if l != employee_name
+    ]
+    dup_labels = [l for l in state.known_labels if l != employee_name]
+    match_label, match_dist, _ = find_best_match(
+        np.asarray(embedding), dup_encodings, dup_labels, state.threshold
+    )
+    if match_label != "Unknown":
+        existing = state.db_conn.execute(
+            "SELECT name, pos_employee_id FROM employees WHERE id = ? AND is_active = 1",
+            (match_label,),
+        ).fetchone()
+        existing_name = existing[0] if existing else match_label
+        existing_pos = existing[1] if existing else None
+        _record_notification(
+            state.db_conn,
+            kind="duplicate_face_enrollment",
+            severity="alert",
+            message=(
+                f"Enrollment blocked: the captured face already belongs to active "
+                f"employee '{existing_name}' (id={match_label}). Attempted to enroll "
+                f"as '{first} {last}' (POS {pos_id})."
+            ),
+            payload={
+                "store_id": state.store_id,
+                "device_id": state.device_id,
+                "existing_employee_id": match_label,
+                "existing_employee_name": existing_name,
+                "existing_pos_employee_id": existing_pos,
+                "attempted_name": f"{first} {last}",
+                "attempted_pos_employee_id": pos_id,
+                "match_distance": round(float(match_dist), 4),
+            },
+        )
+        return EnrollResponse(
+            status="duplicate_face",
+            message=f"This face is already enrolled as {existing_name}.",
+            employee_name=employee_name,
+        )
 
     # ── Persist to pkl (before in-memory and photo — safer ordering) ──
     try:

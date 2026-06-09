@@ -303,6 +303,19 @@
         showResult({ icon: "\u26D4", name: "", action: data.message, cardClass: "result-spoof" });
         break;
 
+      case "duplicate_face":
+        // Same physical face already belongs to an active employee. Hard stop \u2014
+        // flash a prominent red error and keep the form filled so the manager
+        // can review who it matched.
+        showResult({
+          icon: "\u26D4",
+          name: "This Face Already Exists",
+          action: data.message || "This face is already enrolled to another employee.",
+          cardClass: "result-duplicate",
+        });
+        setStatus("error", "Enrollment blocked \u2014 duplicate face");
+        break;
+
       default:
         showResult({ icon: "\u2716", name: "", action: data.message || "Unknown error", cardClass: "result-spoof" });
         break;

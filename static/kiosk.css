@@ -148,6 +148,28 @@ body {
   color: #fecaca;
 }
 
+/* Duplicate-face enrollment: a hard block. Red like spoof, but flashes to
+   draw the manager's eye since this is a fraud/data-integrity signal. */
+.result-duplicate {
+  background: #7f1d1d;
+  border: 2px solid #ef4444;
+  color: #fecaca;
+  animation: duplicate-flash 0.7s ease-in-out infinite;
+}
+
+@keyframes duplicate-flash {
+  0%, 100% {
+    background: #7f1d1d;
+    border-color: #ef4444;
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.0);
+  }
+  50% {
+    background: #b91c1c;
+    border-color: #fca5a5;
+    box-shadow: 0 0 24px 4px rgba(239, 68, 68, 0.6);
+  }
+}
+
 .result-unknown {
   background: #713f12;
   border: 2px solid #f59e0b;
