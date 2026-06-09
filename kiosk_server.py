@@ -1329,8 +1329,11 @@ async def enroll(request: Request, body: EnrollRequest):
             },
         )
         return EnrollResponse(
+            # Intentionally generic — don't leak which employee this face belongs
+            # to on the kiosk UI. The matched name stays in the stdout banner and
+            # the notification payload for the admin/audit side only.
             status="duplicate_face",
-            message=f"This face is already enrolled as {existing_name}.",
+            message="This face is already enrolled to another employee.",
             employee_name=employee_name,
         )
 
