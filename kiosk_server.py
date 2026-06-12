@@ -17,7 +17,6 @@ import csv
 import io
 import json
 import os
-import pickle
 import re
 import sqlite3
 import sys
@@ -43,6 +42,7 @@ from detector_factory import FaceDetector, align_face, create_detector
 from embedding_factory import create_embedder
 from euclideanDist import euclidean_distance
 from liveness import LivenessManager, SessionState
+from pkl_store import remove as remove_encoding_from_pkl, upsert as upsert_encoding_to_pkl
 from recognize import find_best_match, load_database
 from sync_worker import SyncWorker
 from roster_client import RosterClient
@@ -404,38 +404,9 @@ def purge_old_records(conn: sqlite3.Connection,
 # Enrollment persistence
 # ═══════════════════════════════════════════════════════════════════════
 
-def remove_encoding_from_pkl(db_path: str, label: str) -> None:
-    """Remove all entries for a label from the pkl file (atomic write)."""
-    with open(db_path, "rb") as f:
-        db = pickle.load(f)
-    # Filter all three parallel lists together
-    filtered = [
-        (enc, lbl, meta)
-        for enc, lbl, meta in zip(db.encodings, db.labels, db.meta)
-        if lbl != label
-    ]
-    if filtered:
-        db.encodings, db.labels, db.meta = map(list, zip(*filtered))
-    else:
-        db.encodings, db.labels, db.meta = [], [], []
-    tmp_path = db_path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(db, f)
-    os.replace(tmp_path, db_path)
-
-
-def save_encoding_to_pkl(db_path: str, embedding: np.ndarray, label: str) -> None:
-    """Append one encoding to the pkl file on disk using atomic write."""
-    with open(db_path, "rb") as f:
-        db = pickle.load(f)
-    db.encodings.append(embedding.tolist())
-    db.labels.append(label)
-    db.meta.append({"source": "kiosk_enrollment", "label": label})
-    tmp_path = db_path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(db, f)
-    os.replace(tmp_path, db_path)
-
+# pkl read-modify-write now lives in pkl_store (shared with roster_client —
+# which cannot import this module because argparse runs at module load).
+# remove_encoding_from_pkl / upsert_encoding_to_pkl are imported above.
 
 def reconcile_recognition_state(
     conn: sqlite3.Connection,
@@ -1382,8 +1353,12 @@ async def enroll(request: Request, body: EnrollRequest):
         )
 
     # ── Persist to pkl (before in-memory and photo — safer ordering) ──
+    # upsert (drop-then-append) rather than plain append: the duplicate-name
+    # check above blocks re-enrolling an existing employee through this
+    # endpoint, but if a label ever does recur the old encoding is replaced
+    # instead of accumulating as a stale duplicate.
     try:
-        save_encoding_to_pkl(args.database, embedding, employee_name)
+        upsert_encoding_to_pkl(args.database, employee_name, embedding, source="kiosk_enrollment")
     except Exception as e:
         return EnrollResponse(status="error", message=f"Failed to save encoding: {e}", employee_name=employee_name)
 

@@ -43,11 +43,12 @@ import asyncio
 import base64
 import json
 import os
-import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import numpy as np
+
+import pkl_store
 
 
 # Watermark key in the local `sync_state` table.
@@ -244,7 +245,7 @@ class RosterClient:
         embedding = np.frombuffer(base64.b64decode(encoding_b64), dtype=np.float32)
 
         # 1) pkl on disk (atomic) — recognition substrate.
-        self._pkl_upsert(employee_id, embedding)
+        pkl_store.upsert(self.pkl_path, employee_id, embedding, source="roster_sync")
 
         # 2) in-memory lists — single atomic reassignment, no await in between,
         #    so a concurrent /api/recognize sees old-or-new, never half.
@@ -288,7 +289,7 @@ class RosterClient:
         photo_path = row[0]
 
         # 1) pkl wipe (atomic) — stop matching this face across restarts.
-        self._pkl_remove(employee_id)
+        pkl_store.remove(self.pkl_path, employee_id)
 
         # 2) in-memory removal — atomic reassignment, mirrors delete_employee.
         st = self.app.state
@@ -344,52 +345,6 @@ class RosterClient:
             except (ValueError, TypeError):
                 continue
         return False
-
-    # ── pkl helpers (standalone — must NOT import kiosk_server) ───────────────
-    # kiosk_server runs argparse at import time, so importing it here would
-    # re-trigger that. We reimplement the tiny atomic read-modify-write instead.
-    # The pkl holds a build_encodings.EncodingsDB with parallel encodings/labels/
-    # meta lists; unpickling needs that class importable in this namespace.
-
-    def _load_pkl(self):
-        with open(self.pkl_path, "rb") as f:
-            return pickle.load(f)
-
-    def _save_pkl(self, db) -> None:
-        tmp = self.pkl_path + ".tmp"
-        with open(tmp, "wb") as f:
-            pickle.dump(db, f)
-        os.replace(tmp, self.pkl_path)
-
-    def _pkl_upsert(self, label: str, embedding: np.ndarray) -> None:
-        """Replace any existing entries for `label`, then append the fresh one."""
-        db = self._load_pkl()
-        kept = [
-            (enc, lbl, meta)
-            for enc, lbl, meta in zip(db.encodings, db.labels, db.meta)
-            if lbl != label
-        ]
-        if kept:
-            db.encodings, db.labels, db.meta = map(list, zip(*kept))
-        else:
-            db.encodings, db.labels, db.meta = [], [], []
-        db.encodings.append(embedding.tolist())
-        db.labels.append(label)
-        db.meta.append({"source": "roster_sync", "label": label})
-        self._save_pkl(db)
-
-    def _pkl_remove(self, label: str) -> None:
-        db = self._load_pkl()
-        kept = [
-            (enc, lbl, meta)
-            for enc, lbl, meta in zip(db.encodings, db.labels, db.meta)
-            if lbl != label
-        ]
-        if kept:
-            db.encodings, db.labels, db.meta = map(list, zip(*kept))
-        else:
-            db.encodings, db.labels, db.meta = [], [], []
-        self._save_pkl(db)
 
     def _memory_upsert(self, label: str, embedding: np.ndarray) -> None:
         """Atomically replace `label`'s in-memory encoding (drop-then-append)."""
