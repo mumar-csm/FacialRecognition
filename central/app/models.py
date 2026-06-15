@@ -22,6 +22,7 @@ from sqlalchemy import (
     Table,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 
@@ -63,7 +64,17 @@ employees = Table(
     # attendance rows to Simphony employees. Nullable for rows enrolled before
     # this column existed; new enrollments require it at the kiosk API layer.
     Column("pos_employee_id", Text),
-    Column("version", BigInteger, nullable=False, server_default="1"),
+    # Store-monotonic change counter for the roster watermark. Backed by the
+    # `employee_change_seq` sequence (migration 0006) — every enrollment/
+    # deactivation assigns a fresh nextval, so a store's versions are unique and
+    # strictly increasing. Server default fires for inserts that omit it; the
+    # sync handlers set it explicitly on the update paths.
+    Column(
+        "version",
+        BigInteger,
+        nullable=False,
+        server_default=text("nextval('employee_change_seq')"),
+    ),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     PrimaryKeyConstraint("id", "store_id", name="pk_employees"),
     CheckConstraint(

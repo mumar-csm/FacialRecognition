@@ -166,7 +166,11 @@ async def _handle_enrollment(
             "encoding": stmt.excluded.encoding,
             "photo": stmt.excluded.photo,
             "pos_employee_id": stmt.excluded.pos_employee_id,
-            "version": employees.c.version + 1,
+            # Draw a fresh store-monotonic version from the sequence (migration
+            # 0006) so the roster watermark advances correctly. A bare +1 would
+            # repeat values across employees and let the roster pull miss
+            # changes. New-row inserts get nextval via the column default.
+            "version": func.nextval("employee_change_seq"),
             "updated_at": func.now(),
         },
         where=stmt.excluded.enrolled_at > employees.c.enrolled_at,
@@ -214,7 +218,10 @@ async def _handle_deactivation(
             encoding=None,
             photo=None,
             updated_at=func.now(),
-            version=employees.c.version + 1,
+            # Store-monotonic version from the sequence (see migration 0006 and
+            # the enrollment handler) — the roster watermark relies on versions
+            # being unique + increasing across the whole store.
+            version=func.nextval("employee_change_seq"),
         )
     )
 

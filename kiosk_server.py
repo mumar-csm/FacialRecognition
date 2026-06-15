@@ -17,7 +17,6 @@ import csv
 import io
 import json
 import os
-import pickle
 import re
 import sqlite3
 import sys
@@ -43,8 +42,10 @@ from detector_factory import FaceDetector, align_face, create_detector
 from embedding_factory import create_embedder
 from euclideanDist import euclidean_distance
 from liveness import LivenessManager, SessionState
+from pkl_store import remove as remove_encoding_from_pkl, upsert as upsert_encoding_to_pkl
 from recognize import find_best_match, load_database
 from sync_worker import SyncWorker
+from roster_client import RosterClient
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -118,6 +119,15 @@ def init_kiosk_db(db_path: str) -> sqlite3.Connection:
             sent_at       TEXT,
             attempts      INTEGER NOT NULL DEFAULT 0,
             last_error    TEXT
+        );
+
+        -- Small key/value scratchpad for sync bookkeeping. Currently holds one
+        -- row: the roster pull watermark ('roster_version') — the highest
+        -- central employees.version this kiosk has applied. The roster client
+        -- pulls `?since=<this>` so each poll only fetches what changed.
+        CREATE TABLE IF NOT EXISTS sync_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
 
         -- Admin-facing notifications. Early stage of an alerting system: events
@@ -394,38 +404,9 @@ def purge_old_records(conn: sqlite3.Connection,
 # Enrollment persistence
 # ═══════════════════════════════════════════════════════════════════════
 
-def remove_encoding_from_pkl(db_path: str, label: str) -> None:
-    """Remove all entries for a label from the pkl file (atomic write)."""
-    with open(db_path, "rb") as f:
-        db = pickle.load(f)
-    # Filter all three parallel lists together
-    filtered = [
-        (enc, lbl, meta)
-        for enc, lbl, meta in zip(db.encodings, db.labels, db.meta)
-        if lbl != label
-    ]
-    if filtered:
-        db.encodings, db.labels, db.meta = map(list, zip(*filtered))
-    else:
-        db.encodings, db.labels, db.meta = [], [], []
-    tmp_path = db_path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(db, f)
-    os.replace(tmp_path, db_path)
-
-
-def save_encoding_to_pkl(db_path: str, embedding: np.ndarray, label: str) -> None:
-    """Append one encoding to the pkl file on disk using atomic write."""
-    with open(db_path, "rb") as f:
-        db = pickle.load(f)
-    db.encodings.append(embedding.tolist())
-    db.labels.append(label)
-    db.meta.append({"source": "kiosk_enrollment", "label": label})
-    tmp_path = db_path + ".tmp"
-    with open(tmp_path, "wb") as f:
-        pickle.dump(db, f)
-    os.replace(tmp_path, db_path)
-
+# pkl read-modify-write now lives in pkl_store (shared with roster_client —
+# which cannot import this module because argparse runs at module load).
+# remove_encoding_from_pkl / upsert_encoding_to_pkl are imported above.
 
 def reconcile_recognition_state(
     conn: sqlite3.Connection,
@@ -535,6 +516,11 @@ def parse_args():
     p.add_argument("--sync-batch-size", type=int, default=None,
                    dest="sync_batch_size",
                    help="Max outbox rows per upload batch (default 50)")
+    p.add_argument("--roster-interval-seconds", type=int, default=None,
+                   dest="roster_interval_seconds",
+                   help="How often the roster client pulls central for changes it didn't originate "
+                        "(seconds, production default 1800 = 30 min; HQ-initiated deactivations take "
+                        "effect at the store within one cycle. Override to ~30 for dev/testing)")
     p.add_argument("--enrollment-pin", default=None,
                    dest="enrollment_pin",
                    help="Manager PIN required to enroll/delete employees (optional)")
@@ -565,7 +551,8 @@ def _apply_device_config(args):
 
     # Fields that can come from CLI or config file
     for field in ("device_id", "store_id", "central_url",
-                  "sync_interval_seconds", "sync_batch_size"):
+                  "sync_interval_seconds", "sync_batch_size",
+                  "roster_interval_seconds"):
         if getattr(args, field, None) is None and field in cfg:
             setattr(args, field, cfg[field])
 
@@ -579,6 +566,13 @@ def _apply_device_config(args):
         args.sync_interval_seconds = 1800  # 30 min production default. Override to 30 for dev/testing.
     if args.sync_batch_size is None:
         args.sync_batch_size = 50
+    if args.roster_interval_seconds is None:
+        # 30 min production default. HQ directly removing an employee (vs.
+        # delegating to the store manager, who deletes at the kiosk for immediate
+        # effect) is rare, so up to 30 min of propagation latency on that rare
+        # event is fine. Override with --roster-interval-seconds (e.g. 10 for
+        # testing) or the roster_interval_seconds key in device.json.
+        args.roster_interval_seconds = 1800
 
     # Fail fast: enabling sync requires both a URL and an API key
     if args.central_url:
@@ -682,7 +676,7 @@ async def lifespan(app: FastAPI):
 
     pin_status = "protected" if args.enrollment_pin else "open"
     sync_status = (f"central={args.central_url}, interval={args.sync_interval_seconds}s, "
-                   f"batch={args.sync_batch_size}") if args.central_url else "disabled"
+                   f"batch={args.sync_batch_size}, roster={args.roster_interval_seconds}s") if args.central_url else "disabled"
     print(f"[STARTUP] Ready — store={args.store_id}, device={args.device_id}, "
           f"tz={args.timezone}, enrollment={pin_status}, {len(labels)} employees, "
           f"threshold={args.threshold}, cooldown={args.cooldown}s, "
@@ -693,6 +687,7 @@ async def lifespan(app: FastAPI):
     # outbox rows still get written (kiosk works offline) — they just sit until
     # the operator wires up --central-url.
     app.state.sync_worker = None
+    app.state.roster_client = None
     if args.central_url:
         app.state.sync_worker = SyncWorker(
             db_path=args.sqlite,
@@ -703,9 +698,29 @@ async def lifespan(app: FastAPI):
         )
         app.state.sync_worker.start()
 
+        # Roster client pulls central for changes this kiosk didn't originate
+        # (HQ-initiated deactivations, and its own enrollments echoed back once).
+        # Shares the same central URL + API key as the sync worker; runs on the
+        # event loop and mutates app.state.known_encodings/labels in place, so it
+        # is handed the app to reach that shared recognition state.
+        app.state.roster_client = RosterClient(
+            app=app,
+            central_url=args.central_url,
+            api_key=os.environ["CENTRAL_API_KEY"],
+            pkl_path=args.database,
+            store_id=args.store_id,
+            expected_embedder=args.embedder,
+            interval_seconds=args.roster_interval_seconds,
+        )
+        app.state.roster_client.start()
+
     yield
 
-    # Shutdown
+    # Shutdown — stop the background writers and wait for their current tick to
+    # finish before closing the SQLite connection the roster client writes
+    # through (a close mid-apply would raise "operation on a closed database").
+    if app.state.roster_client is not None:
+        await app.state.roster_client.stop()
     if app.state.sync_worker is not None:
         await app.state.sync_worker.stop()
     app.state.db_conn.commit()
@@ -1329,14 +1344,21 @@ async def enroll(request: Request, body: EnrollRequest):
             },
         )
         return EnrollResponse(
+            # Intentionally generic — don't leak which employee this face belongs
+            # to on the kiosk UI. The matched name stays in the stdout banner and
+            # the notification payload for the admin/audit side only.
             status="duplicate_face",
-            message=f"This face is already enrolled as {existing_name}.",
+            message="This face is already enrolled to another employee.",
             employee_name=employee_name,
         )
 
     # ── Persist to pkl (before in-memory and photo — safer ordering) ──
+    # upsert (drop-then-append) rather than plain append: the duplicate-name
+    # check above blocks re-enrolling an existing employee through this
+    # endpoint, but if a label ever does recur the old encoding is replaced
+    # instead of accumulating as a stale duplicate.
     try:
-        save_encoding_to_pkl(args.database, embedding, employee_name)
+        upsert_encoding_to_pkl(args.database, employee_name, embedding, source="kiosk_enrollment")
     except Exception as e:
         return EnrollResponse(status="error", message=f"Failed to save encoding: {e}", employee_name=employee_name)
 

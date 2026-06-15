@@ -1,7 +1,9 @@
 """Central tier FastAPI app — entry point.
 
 Step 2a: /health (public readiness check) + POST /api/sync/batch (device-auth
-via require_device dep). Admin endpoints (roster, employees) land in 2b.
+via require_device dep).
+Step 2b: GET /api/roster (device-auth, store-scoped incremental pull). HQ
+admin endpoints (employees, attendance) land later in 2b behind user auth.
 
 Run locally:
     cd central && make dev
@@ -13,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from . import db, sync
+from . import db, roster, sync
 
 
 @asynccontextmanager
@@ -27,6 +29,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="FR Central", lifespan=lifespan)
 app.include_router(sync.router)
+app.include_router(roster.router)
 
 
 @app.get("/health")
