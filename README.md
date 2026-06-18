@@ -91,6 +91,9 @@ pip install -r requirements.txt
 FacialRecognition/
 ├── build_encodings.py      # Build face embeddings database
 ├── recognize.py            # Runtime recognition (webcam/image/video/RTSP)
+├── kiosk_server.py         # Kiosk attendance server (pilot app, FastAPI)
+├── liveness.py             # Blink-based liveness challenge
+├── anti_spoof_factory.py   # Anti-spoof backends (MiniFAS)
 ├── detector_factory.py     # Detection backends (Haar, RetinaFace)
 ├── embedding_factory.py    # Embedding backends (dlib, ArcFace)
 ├── tracker.py              # SimpleTracker for real-time optimization
@@ -239,6 +242,132 @@ brew install mediamtx ffmpeg
 MediaMTX bridges RTMP input to RTSP output on the same path name (`live`). The recognition app auto-detects the RTSP URL and uses the RTSP handler with reconnection logic.
 
 > **Note**: FPS will match your source video's frame rate (e.g., 20 FPS source = 20 FPS recognition). When the ffmpeg stream is stopped, the app will attempt reconnection up to 5 times before exiting gracefully.
+
+## Kiosk Attendance Server (Pilot App)
+
+`kiosk_server.py` is the tablet/Pi attendance kiosk: it runs the full pipeline (detect → anti-spoof → align → embed → match → identity consensus → blink liveness challenge → clock-in/out) behind a FastAPI web UI. This is the app used in the in-store pilot.
+
+> **Tip:** activate the environment first (`conda activate face`), or prefix any command with `conda run --no-capture-output -n <env> ...`.
+
+**Start the server (defaults)**
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl
+```
+
+Then open the web UI in a browser:
+
+| URL | Page |
+|-----|------|
+| `http://127.0.0.1:8000/` | Kiosk (clock-in/out) |
+| `http://127.0.0.1:8000/enroll` | Enroll a new employee from the camera |
+| `http://127.0.0.1:8000/manage` | View / delete employees |
+| `http://127.0.0.1:8000/report` | Attendance report + CSV export |
+
+> By default the server binds to loopback (`127.0.0.1`), so it's only reachable from the same machine. To open it to other devices on the LAN, add `--host 0.0.0.0` (only do this on a trusted network).
+
+### Common Run Configurations
+
+**Testing — short cooldown (clock in/out repeatedly without waiting)**
+
+The default 120 s cooldown blocks duplicate clock events, which is painful when testing. Drop it to a few seconds so you can repeatedly clock the same person:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl --cooldown 5
+```
+
+**Fast test run — easier identity confirmation**
+
+Lower the consensus frame count and give a longer window for the blink challenge while you're getting set up:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl \
+  --cooldown 5 --consensus 1 --challenge-timeout 15
+```
+
+**Disable the MiniFAS pre-screen**
+
+Anti-spoofing has two independent layers: the MiniFAS per-frame pre-screen and the blink liveness challenge. `--anti-spoof none` turns off **only** MiniFAS — the **blink challenge still runs** and remains the primary gate, so photos are still blocked. (K2 testing found blink is the layer that actually stops phone-photo attacks; MiniFAS scores high-quality photos as "real".) Useful for removing MiniFAS borderline false-rejects while testing, without losing photo protection:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl --anti-spoof none
+```
+
+**Stricter / looser face matching**
+
+`--threshold` is the distance cutoff (lower = stricter, fewer false matches; higher = more lenient). For an ArcFace database, ~0.6 is the working default:
+```bash
+# Stricter — reject borderline matches
+python kiosk_server.py --database data/known_faces_arcface.pkl --threshold 0.5
+
+# Looser — accept more distant matches (more false accepts)
+python kiosk_server.py --database data/known_faces_arcface.pkl --threshold 0.75
+```
+
+**Stricter anti-spoof**
+
+`--spoof-threshold` is the "real face" probability cutoff (0–1, higher = stricter). Raise it if photo attacks are slipping through:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl --spoof-threshold 0.7
+```
+
+**Faster pipeline on weak hardware (e.g. Raspberry Pi) — recommended Pi config**
+
+Use `--detector scrfd` and shrink the detector input size. `scrfd` is the **same** detection network as the default `retinaface`, but loaded directly — it skips the `FaceAnalysis` auxiliary models (106-point landmarks, 3D landmarks, gender/age) that run every frame and the kiosk never uses, so it's faster with no loss of accuracy or landmark quality. `--det-size 320` is the default; 256 or 224 trades a little accuracy for more speed:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl --detector scrfd --det-size 256
+```
+
+> `scrfd` expects the buffalo_l model already on disk (`~/.insightface/models/buffalo_l/det_10g.onnx`) and errors if it's missing. It's present once you've built the ArcFace database (Step 2 downloads it). The default `retinaface` auto-downloads buffalo_l on first run, which is why it stays the safe out-of-box default — but on a Pi or in production, `scrfd` is the better choice.
+
+**Manager-PIN-gated enrollment**
+
+Require a PIN before anyone can enroll or delete employees via the web UI:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl --enrollment-pin 4821
+```
+
+**Local timezone for reports**
+
+Report timestamps default to UTC. Set the store's timezone so the report page reads correctly:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl --timezone America/New_York
+```
+
+**Dev sync/roster intervals (central HQ wiring)**
+
+Production drains the outbox and pulls the roster every 30 min. For local testing against a central server, point at it and tighten the intervals so changes propagate in seconds:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl \
+  --central-url http://localhost:9000 --store-id downtown-01 \
+  --sync-interval-seconds 30 --roster-interval-seconds 30
+# API key is read from the CENTRAL_API_KEY env var, never a flag
+```
+
+### Kiosk Server Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--database` | Face encodings pkl file | `data/known_faces_arcface.pkl` |
+| `--sqlite` | Attendance/spoof SQLite DB | `data/kiosk.db` |
+| `--threshold` | Face-match distance cutoff (lower = stricter) | `0.6` |
+| `--cooldown` | Seconds between duplicate clock events | `120` |
+| `--consensus` | Consecutive frames to confirm identity before liveness | `3` |
+| `--spoof-threshold` | Anti-spoof "real" probability cutoff (higher = stricter) | `0.55` |
+| `--challenge-timeout` | Seconds allowed for the blink challenge | `8.0` |
+| `--anti-spoof` | Anti-spoof backend: `minifas`, `none` | `minifas` |
+| `--detector` | Detection backend: `retinaface`, `scrfd`, `haar`. `scrfd` is the same model as `retinaface` with less overhead — recommended on a Pi (see above) | `retinaface` |
+| `--det-size` | Detector input size (smaller = faster) | `320` |
+| `--embedder` | Embedding backend: `arcface`, `dlib` | `arcface` |
+| `--enrollment-pin` | Manager PIN to gate enroll/delete | None |
+| `--timezone` | Local timezone for report timestamps | `UTC` |
+| `--camera-id` | Identifier for this kiosk instance | `kiosk-01` |
+| `--retention-days` | Attendance record retention | `365` |
+| `--spoof-retention-days` | Spoof-attempt record retention | `90` |
+| `--store-id` / `--device-id` | Location / Pi identifiers (multi-store sync) | host fallback |
+| `--device-config` | JSON file with device/store/central settings | None |
+| `--central-url` | Central HQ base URL (omit to disable upload) | None |
+| `--sync-interval-seconds` | Outbox drain interval (prod 1800) | 1800 |
+| `--roster-interval-seconds` | Roster pull interval (prod 1800) | 1800 |
+| `--host` / `--port` | Bind address / port | `127.0.0.1` / `8000` |
+
+> The `CENTRAL_API_KEY` for HQ uploads is read from the environment only, never passed as a flag.
 
 ## Utilities
 
