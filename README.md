@@ -311,7 +311,7 @@ python kiosk_server.py --database data/known_faces_arcface.pkl --spoof-threshold
 
 Use `--detector scrfd` and shrink the detector input size. `scrfd` is the **same** detection network as the default `retinaface`, but loaded directly — it skips the `FaceAnalysis` auxiliary models (106-point landmarks, 3D landmarks, gender/age) that run every frame and the kiosk never uses, so it's faster with no loss of accuracy or landmark quality. `--det-size 320` is the default; 256 or 224 trades a little accuracy for more speed:
 ```bash
-python kiosk_server.py --database data/known_faces_arcface.pkl --detector scrfd --det-size 256
+python kiosk_server.py --database data/known_faces_arcface.pkl --detector scrfd
 ```
 
 > `scrfd` expects the buffalo_l model already on disk (`~/.insightface/models/buffalo_l/det_10g.onnx`) and errors if it's missing. It's present once you've built the ArcFace database (Step 2 downloads it). The default `retinaface` auto-downloads buffalo_l on first run, which is why it stays the safe out-of-box default — but on a Pi or in production, `scrfd` is the better choice.
@@ -340,6 +340,16 @@ python kiosk_server.py --database data/known_faces_arcface.pkl \
 # API key is read from the CENTRAL_API_KEY env var, never a flag
 ```
 
+**POS punch bridge (type the employee's POS ID into Oracle on clock-in/out)**
+
+When a Teensy POS bridge is attached (see [pos_bridge/](pos_bridge/)), point the kiosk at its serial device and every successful clock-in/out types the recognized employee's 7-digit POS ID into the focused POS terminal:
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl \
+  --pos-serial-port /dev/cu.usbmodem12345
+```
+
+> Punching is **best-effort**: attendance is always recorded even if the Teensy is unplugged or the port is wrong — those just log a warning. Omit `--pos-serial-port` to disable it entirely. Employees without a POS ID are skipped.
+
 ### Kiosk Server Options
 
 | Flag | Description | Default |
@@ -365,6 +375,8 @@ python kiosk_server.py --database data/known_faces_arcface.pkl \
 | `--central-url` | Central HQ base URL (omit to disable upload) | None |
 | `--sync-interval-seconds` | Outbox drain interval (prod 1800) | 1800 |
 | `--roster-interval-seconds` | Roster pull interval (prod 1800) | 1800 |
+| `--pos-serial-port` | Teensy POS punch bridge serial device (omit to disable; see [pos_bridge/](pos_bridge/)) | None |
+| `--pos-baud` | Baud for the POS serial bridge (must match the Teensy sketch) | `115200` |
 | `--host` / `--port` | Bind address / port | `127.0.0.1` / `8000` |
 
 > The `CENTRAL_API_KEY` for HQ uploads is read from the environment only, never passed as a flag.

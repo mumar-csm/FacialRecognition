@@ -5,8 +5,20 @@ Oracle POS terminal, posing as a USB keyboard. Lets face recognition replace
 the customer's existing fingerprint or manual-digit punch flow **without**
 integrating any Oracle-side API.
 
-This is the prototype. Wiring it into `kiosk_server.py` happens after a
-bench test confirms the hardware chain works end-to-end.
+The kiosk wiring is in place: `kiosk_server.py` imports `PosPunch` from
+`punch.py` and, on every successful clock-in/out, sends the recognized
+employee's POS ID to the Teensy. Enable it by pointing the server at the serial
+device:
+
+```bash
+python kiosk_server.py --database data/known_faces_arcface.pkl \
+  --pos-serial-port /dev/cu.usbmodem12345   # add --pos-baud if not 115200
+```
+
+Punching is **best-effort** — attendance is always recorded even if the Teensy
+is unplugged or the port is wrong (those just log a warning), and the feature is
+off entirely when `--pos-serial-port` is omitted. Run the bench test below first
+to confirm the hardware chain before relying on it in the store.
 
 ## Architecture
 
@@ -27,9 +39,11 @@ Teensy's USB cable is plugged into.
 - `teensy_punch/teensy_punch.ino` — Arduino sketch (Teensyduino) that runs on
   the Teensy itself. The folder name must match the sketch filename — that's
   how the Arduino IDE expects sketch projects to be laid out.
-- `sender.py` — Python harness that sends test IDs to the Teensy over serial.
-  Used for bench testing; not part of production. Production sending will be
-  wired into `kiosk_server.py` once the hardware chain is validated.
+- `punch.py` — reusable `PosPunch` class that owns the serial protocol (open,
+  send a 7-digit ID, read back the Teensy's `OK`/`ERR` reply). Imported by both
+  `kiosk_server.py` (live punching) and `sender.py` (bench testing).
+- `sender.py` — Python harness that sends test IDs to the Teensy over serial,
+  built on `punch.py`. Used for bench testing; not part of the kiosk runtime.
 
 ## Bench test (Mac, no POS terminal needed)
 
