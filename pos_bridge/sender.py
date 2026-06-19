@@ -22,59 +22,41 @@ Requires
 """
 
 import argparse
-import re
 import sys
 
 import serial
 
-
-POS_ID_RE = re.compile(r"^\d{7}$")
-
-
-def drain(ser: serial.Serial) -> None:
-    """Print and consume any lines the Teensy has queued."""
-    while ser.in_waiting:
-        line = ser.readline().decode("ascii", errors="replace").rstrip()
-        if line:
-            print(f"  teensy: {line}")
+from punch import DEFAULT_BAUD, PosPunch
 
 
-def send_one(ser: serial.Serial, pos_id: str) -> None:
-    if not POS_ID_RE.match(pos_id):
-        print(f"  refusing to send: {pos_id!r} is not exactly 7 digits",
-              file=sys.stderr)
-        return
-    ser.write((pos_id + "\n").encode("ascii"))
-    ser.flush()
-    # Read the Teensy's one-line response (OK ... or ERR ...). timeout=1 on
-    # the serial open means readline returns after 1s if nothing arrives,
-    # which is plenty for the Teensy to echo a status line.
-    line = ser.readline().decode("ascii", errors="replace").rstrip()
-    if line:
-        print(f"  teensy: {line}")
+def send_one(punch: PosPunch, pos_id: str) -> None:
+    ok, detail = punch.send(pos_id)
+    # send() refuses malformed IDs without touching the wire; surface that to
+    # stderr. A real Teensy reply (OK/ERR) goes to stdout for the operator.
+    if not ok and detail.startswith("refused"):
+        print(f"  {detail}", file=sys.stderr)
+    else:
+        print(f"  teensy: {detail}")
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--port", required=True,
                    help="serial device path (e.g. /dev/cu.usbmodem12345)")
-    p.add_argument("--baud", type=int, default=115200,
-                   help="serial baud (must match the Teensy sketch; default 115200)")
+    p.add_argument("--baud", type=int, default=DEFAULT_BAUD,
+                   help=f"serial baud (must match the Teensy sketch; default {DEFAULT_BAUD})")
     p.add_argument("--id", default=None,
                    help="if set, send this ID and exit; otherwise interactive")
     args = p.parse_args()
 
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=1)
+        punch = PosPunch(args.port, args.baud)
     except serial.SerialException as e:
         print(f"could not open {args.port}: {e}", file=sys.stderr)
         return 1
 
-    # Catch the Teensy's startup banner so we know it's enumerated.
-    drain(ser)
-
     if args.id is not None:
-        send_one(ser, args.id)
+        send_one(punch, args.id)
     else:
         print("ready — enter 7-digit IDs, Ctrl-C to exit")
         try:
@@ -82,11 +64,11 @@ def main() -> int:
                 pos_id = input("> ").strip()
                 if not pos_id:
                     continue
-                send_one(ser, pos_id)
+                send_one(punch, pos_id)
         except (KeyboardInterrupt, EOFError):
             print()
 
-    ser.close()
+    punch.close()
     return 0
 
 

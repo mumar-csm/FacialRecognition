@@ -21,3 +21,7 @@ python-multipart>=0.0.6
 # Sync substrate — async HTTP client used by sync_worker.py to upload
 # outbox events to central HQ
 httpx>=0.25.0
+
+# POS punch bridge — serial link to the Teensy USB-HID device (pos_bridge/).
+# Only needed when running the kiosk with --pos-serial-port.
+pyserial>=3.5

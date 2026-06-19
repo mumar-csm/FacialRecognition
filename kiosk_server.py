@@ -46,6 +46,8 @@ from pkl_store import remove as remove_encoding_from_pkl, upsert as upsert_encod
 from recognize import find_best_match, load_database
 from sync_worker import SyncWorker
 from roster_client import RosterClient
+# PosPunch is imported lazily inside lifespan() only when --pos-serial-port is
+# set, so the kiosk doesn't hard-depend on pyserial unless POS punching is used.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -262,6 +264,19 @@ def log_attendance(conn: sqlite3.Connection, employee_id: str,
         )
         _enqueue_outbox(conn, "attendance", payload, ts)
     return cursor.lastrowid
+
+
+def get_pos_employee_id(conn: sqlite3.Connection, employee_id: str) -> Optional[str]:
+    """Return the active employee's 7-digit POS ID, or None if absent/inactive.
+
+    None covers both an unknown id and the legacy starter rows with a NULL
+    pos_employee_id — callers skip the POS punch in either case.
+    """
+    row = conn.execute(
+        "SELECT pos_employee_id FROM employees WHERE id = ? AND is_active = 1",
+        (employee_id,),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def log_spoof_attempt(conn: sqlite3.Connection, camera_id: str, spoof_score: float,
@@ -526,6 +541,11 @@ def parse_args():
                    help="Manager PIN required to enroll/delete employees (optional)")
     p.add_argument("--timezone", default="UTC",
                    help="Local timezone for report timestamps (e.g. 'America/New_York')")
+    p.add_argument("--pos-serial-port", default=None, dest="pos_serial_port",
+                   help="Serial device of the Teensy POS punch bridge (e.g. /dev/cu.usbmodem* "
+                        "or /dev/ttyACM0). Omit to disable POS punching; clock-in/out still works.")
+    p.add_argument("--pos-baud", type=int, default=None, dest="pos_baud",
+                   help="Baud for the POS serial bridge (must match the Teensy sketch; default 115200)")
     p.add_argument("--host", default="127.0.0.1",
                    help="Bind address. Defaults to loopback so the API is only reachable from the same machine "
                         "(the Pi-kiosk model). Set to '0.0.0.0' only if you intentionally want LAN exposure.")
@@ -552,7 +572,7 @@ def _apply_device_config(args):
     # Fields that can come from CLI or config file
     for field in ("device_id", "store_id", "central_url",
                   "sync_interval_seconds", "sync_batch_size",
-                  "roster_interval_seconds"):
+                  "roster_interval_seconds", "pos_serial_port", "pos_baud"):
         if getattr(args, field, None) is None and field in cfg:
             setattr(args, field, cfg[field])
 
@@ -566,6 +586,8 @@ def _apply_device_config(args):
         args.sync_interval_seconds = 1800  # 30 min production default. Override to 30 for dev/testing.
     if args.sync_batch_size is None:
         args.sync_batch_size = 50
+    if args.pos_baud is None:
+        args.pos_baud = 115200  # must match Serial.begin() in teensy_punch.ino
     if args.roster_interval_seconds is None:
         # 30 min production default. HQ directly removing an employee (vs.
         # delegating to the store manager, who deletes at the kiosk for immediate
@@ -674,6 +696,20 @@ async def lifespan(app: FastAPI):
     app.state.enrollment_pin = args.enrollment_pin
     app.state.local_tz = local_tz
 
+    # POS punch bridge (Teensy USB-HID). Best-effort: if the port can't be
+    # opened (Teensy unplugged, wrong path), log and run without it — the kiosk
+    # must keep clocking people even when the POS bridge is down.
+    app.state.pos_punch = None
+    if args.pos_serial_port:
+        try:
+            from pos_bridge.punch import PosPunch
+            app.state.pos_punch = PosPunch(args.pos_serial_port, args.pos_baud)
+        except Exception as e:
+            print(f"[STARTUP] WARNING: could not open POS serial port "
+                  f"'{args.pos_serial_port}': {e} — POS punching disabled.")
+    pos_status = (f"{args.pos_serial_port}@{args.pos_baud}"
+                  if app.state.pos_punch else "disabled")
+
     pin_status = "protected" if args.enrollment_pin else "open"
     sync_status = (f"central={args.central_url}, interval={args.sync_interval_seconds}s, "
                    f"batch={args.sync_batch_size}, roster={args.roster_interval_seconds}s") if args.central_url else "disabled"
@@ -681,7 +717,7 @@ async def lifespan(app: FastAPI):
           f"tz={args.timezone}, enrollment={pin_status}, {len(labels)} employees, "
           f"threshold={args.threshold}, cooldown={args.cooldown}s, "
           f"consensus={args.consensus} frames, spoof_threshold={args.spoof_threshold}, "
-          f"challenge_timeout={args.challenge_timeout}s, sync={sync_status}")
+          f"challenge_timeout={args.challenge_timeout}s, sync={sync_status}, pos={pos_status}")
 
     # Start the outbox sync worker if a central URL is configured. When it isn't,
     # outbox rows still get written (kiosk works offline) — they just sit until
@@ -723,6 +759,8 @@ async def lifespan(app: FastAPI):
         await app.state.roster_client.stop()
     if app.state.sync_worker is not None:
         await app.state.sync_worker.stop()
+    if app.state.pos_punch is not None:
+        app.state.pos_punch.close()
     app.state.db_conn.commit()
     app.state.db_conn.close()
     print("[SHUTDOWN] Database connection closed.")
@@ -1044,6 +1082,23 @@ async def _recognize_impl(request: Request, body: RecognizeRequest,
         state.cooldown[active_identity] = now
         action = "Clocked In" if is_clock_in else "Clocked Out"
         print(f"[ATTENDANCE] {active_identity} — {action} (avg_dist={avg_distance:.4f})")
+
+        # Punch the employee's POS ID into the Oracle terminal via the Teensy.
+        # Best-effort: attendance is already committed above, so any serial
+        # failure here only logs — it never changes the clock outcome. Fires on
+        # both clock-in and clock-out (the typed ID identifies the punch).
+        if state.pos_punch is not None:
+            pos_id = get_pos_employee_id(state.db_conn, active_identity)
+            if pos_id is None:
+                print(f"[POS] {active_identity} has no POS ID — skipping punch")
+            else:
+                try:
+                    ok, detail = state.pos_punch.send(pos_id)
+                    print(f"[POS] punch {active_identity} -> {pos_id}: "
+                          f"{'OK' if ok else 'FAIL'} ({detail})")
+                except Exception as e:
+                    print(f"[POS] punch failed for {active_identity} ({pos_id}): {e}")
+
         return RecognizeResponse(
             status="recognized",
             identity=active_identity,
