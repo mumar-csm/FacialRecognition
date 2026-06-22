@@ -1,0 +1,44 @@
+# fr-kiosk.service — the kiosk recognition API server (FastAPI).
+#
+# Install (run on the Pi, as root):
+#   sudo cp deploy/fr-kiosk.service /etc/systemd/system/fr-kiosk.service
+#   # edit User= below to the Pi's login user (see note), then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fr-kiosk.service
+#   systemctl status fr-kiosk.service
+#   journalctl -u fr-kiosk -f
+#
+# Prereqs (see PI_SETUP.md): repo at /opt/fr-kiosk, venv at /opt/fr-kiosk/venv,
+# and /etc/fr-kiosk/{device.json,secrets.env} written by tools/provision_device.py.
+
+[Unit]
+Description=FR kiosk recognition API server
+# Sync worker + roster client need the network (DNS / the tailnet) up first.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# IMPORTANT: set this to the Pi's login user (the one created at imaging, often
+# 'pi' or the store name). It needs camera access (video group) and read access
+# to the mode-600 /etc/fr-kiosk/secrets.env. Provisioning writes secrets.env as
+# root by default — chown it to this user, or run provisioning as this user.
+User=pi
+WorkingDirectory=/opt/fr-kiosk
+
+# Injects CENTRAL_API_KEY (and ENROLLMENT_PIN, if provisioned) into the env so
+# they never appear in ExecStart / `ps` / `systemctl cat`.
+EnvironmentFile=/etc/fr-kiosk/secrets.env
+
+# device.json supplies device_id / store_id / central_url / intervals.
+# Bind stays the loopback default (127.0.0.1:8000): the API is reachable only
+# from this Pi, which is all the local Chromium kiosk needs.
+ExecStart=/opt/fr-kiosk/venv/bin/python kiosk_server.py \
+    --device-config /etc/fr-kiosk/device.json \
+    --database data/known_faces_arcface.pkl
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

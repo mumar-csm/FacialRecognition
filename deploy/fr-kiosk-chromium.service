@@ -1,0 +1,31 @@
+# fr-kiosk-chromium.service — launch Chromium in kiosk mode inside the user's
+# graphical session. This is a *user* unit (runs as the logged-in desktop user),
+# NOT a system unit, because it needs the Wayland/X display.
+#
+# Install (run on the Pi as the desktop login user, NOT root):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/fr-kiosk-chromium.service ~/.config/systemd/user/
+#   # ensure the wrapper is executable:
+#   chmod +x /opt/fr-kiosk/deploy/fr-kiosk-chromium.sh
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now fr-kiosk-chromium.service
+#   # so the user session starts at boot without an interactive login:
+#   sudo loginctl enable-linger "$USER"
+#
+# NOTE: graphical-session.target wiring varies by desktop stack (Bookworm
+# Wayland/labwc vs older X/LXDE). If this unit doesn't get a display, use the
+# XDG autostart .desktop alternative documented in PROVISIONING.md instead.
+
+[Unit]
+Description=FR kiosk Chromium (full-screen UI)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/opt/fr-kiosk/deploy/fr-kiosk-chromium.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
