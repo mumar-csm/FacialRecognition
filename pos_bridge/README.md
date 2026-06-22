@@ -36,20 +36,76 @@ Teensy's USB cable is plugged into.
 
 ## Files
 
-- `teensy_punch/teensy_punch.ino` — Arduino sketch (Teensyduino) that runs on
-  the Teensy itself. The folder name must match the sketch filename — that's
+- `teensy_punch/teensy_punch.ino` — Arduino sketch (Teensyduino) that reads the
+  ID from **USB serial**. The folder name must match the sketch filename — that's
   how the Arduino IDE expects sketch projects to be laid out.
+- `teensy_punch_uart/teensy_punch_uart.ino` — same sketch but reads from the
+  **`Serial1` UART pins** instead of USB, for the Pi-on-pins → POS-on-USB
+  deployment. See **Firmware variants** below.
 - `punch.py` — reusable `PosPunch` class that owns the serial protocol (open,
   send a 7-digit ID, read back the Teensy's `OK`/`ERR` reply). Imported by both
   `kiosk_server.py` (live punching) and `sender.py` (bench testing).
 - `sender.py` — Python harness that sends test IDs to the Teensy over serial,
   built on `punch.py`. Used for bench testing; not part of the kiosk runtime.
 
+## Firmware variants
+
+There are two sketches. They speak the **identical wire protocol** (send 7 ASCII
+digits + newline, get back `OK <id>` / `ERR ...`, keystrokes emitted over USB) —
+the only difference is which port the Teensy *reads the ID from*. Flash the one
+that matches your topology; nothing on the Python/kiosk side changes either way.
+
+| Variant | Reads ID from | Topology | Kiosk `--pos-serial-port` |
+|---|---|---|---|
+| `teensy_punch` (USB) | USB `Serial` | **single host** — the machine the Teensy's USB plugs into is both sender *and* keystroke receiver (Pi-to-Pi bench test) | `/dev/ttyACM0` (Linux) / `/dev/cu.usbmodem*` (macOS) |
+| `teensy_punch_uart` (UART) | `Serial1` pins | **two hosts** — Pi sends over its GPIO UART, Teensy types into a *separate* POS over USB (production) | `/dev/serial0` (the Pi's UART) |
+
+Why two: the Teensy has one USB port, and in "Serial + Keyboard" mode that single
+cable carries both the serial link and the keyboard *to the same host*. So USB
+serial can't drive a sender ≠ receiver split — that needs the hardware UART pins.
+
+### UART wiring (Pi ↔ Teensy 4.x)
+
+Pi GPIO and Teensy 4.x pins are both **3.3V**, so they connect directly — **no
+level shifter**. Cross TX↔RX, and share a ground:
+
+| Raspberry Pi | → | Teensy 4.x |
+|---|---|---|
+| TXD0 — GPIO14 (physical pin 8) | → | RX1 — pin 0 |
+| RXD0 — GPIO15 (physical pin 10) | → | TX1 — pin 1 |
+| GND (physical pin 6) | → | GND |
+
+> Teensy 4.x pins are **not** 5V-tolerant — fine here since the Pi is 3.3V, just
+> never feed them 5V.
+
+### Enable the Pi's UART (one-time)
+
+By default the Pi uses the UART for a serial login console. Free it up:
+
+```bash
+sudo raspi-config
+#   Interface Options → Serial Port
+#     "login shell accessible over serial?"  → No
+#     "serial port hardware enabled?"         → Yes
+sudo reboot
+```
+
+The UART is then `/dev/serial0` (a stable symlink to the primary UART). Sanity-
+check the UART itself **before** involving the Teensy by jumpering GPIO14↔GPIO15
+and running the probe below — it should echo your own bytes back:
+
+```bash
+python3 -c "import serial,time; s=serial.Serial('/dev/serial0',115200,timeout=2); time.sleep(1); s.write(b'1234567\n'); print(s.readline())"
+# loopback jumper present → b'1234567\n'   |   Teensy + UART firmware → b'OK 1234567\r\n'
+```
+
+Then start the kiosk against it: `python kiosk_server.py ... --pos-serial-port /dev/serial0`.
+
 ## Bench test (Mac, no POS terminal needed)
 
-This proves the entire hardware chain — Pi/Mac → Teensy → keystrokes-into-app
-— works in isolation, using your Mac in place of both the Pi (sender) and
-the POS terminal (keystroke receiver).
+This uses the **`teensy_punch` (USB)** variant. It proves the entire hardware
+chain — Pi/Mac → Teensy → keystrokes-into-app — works in isolation, using your
+Mac in place of both the Pi (sender) and the POS terminal (keystroke receiver).
 
 1. **Install the Arduino IDE** from <https://www.arduino.cc/en/software>.
 2. **Install Teensyduino** from <https://www.pjrc.com/teensy/teensyduino.html>.
