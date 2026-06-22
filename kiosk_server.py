@@ -519,8 +519,9 @@ def parse_args():
                    help="Stable identifier for this Pi (e.g. 'pi-store-01-a'). "
                         "Falls back to --device-config, then to the machine hostname.")
     p.add_argument("--device-config", default=None, dest="device_config",
-                   help="Optional JSON file with device_id/store_id/central_url/sync_interval_seconds/sync_batch_size. "
-                        "CLI flags override individual fields. The API key is read from CENTRAL_API_KEY env var only.")
+                   help="Optional JSON file with device_id/store_id/central_url/sync_interval_seconds/"
+                        "sync_batch_size/roster_interval_seconds. CLI flags override individual fields. "
+                        "The API key is read from CENTRAL_API_KEY env var only.")
     p.add_argument("--central-url", default=None, dest="central_url",
                    help="Base URL of the central HQ server (e.g. https://central.example.com). "
                         "If omitted, outbox rows are written but never drained — useful for dev/test.")
@@ -538,7 +539,9 @@ def parse_args():
                         "effect at the store within one cycle. Override to ~30 for dev/testing)")
     p.add_argument("--enrollment-pin", default=None,
                    dest="enrollment_pin",
-                   help="Manager PIN required to enroll/delete employees (optional)")
+                   help="Manager PIN required to enroll/delete employees (optional). "
+                        "Falls back to the ENROLLMENT_PIN env var so it can live in the "
+                        "mode-600 secrets.env instead of ExecStart/ps.")
     p.add_argument("--timezone", default="UTC",
                    help="Local timezone for report timestamps (e.g. 'America/New_York')")
     p.add_argument("--pos-serial-port", default=None, dest="pos_serial_port",
@@ -595,6 +598,13 @@ def _apply_device_config(args):
         # event is fine. Override with --roster-interval-seconds (e.g. 10 for
         # testing) or the roster_interval_seconds key in device.json.
         args.roster_interval_seconds = 1800
+
+    # Manager PIN: CLI flag wins, else ENVIRONMENT (so it can live in the mode-600
+    # secrets.env via systemd EnvironmentFile, never in ExecStart / `ps`).
+    if args.enrollment_pin is None:
+        env_pin = os.environ.get("ENROLLMENT_PIN")
+        if env_pin:
+            args.enrollment_pin = env_pin
 
     # Fail fast: enabling sync requires both a URL and an API key
     if args.central_url:
