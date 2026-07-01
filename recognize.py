@@ -32,7 +32,8 @@ from detector_factory import create_detector, align_face, FaceDetector
 from anti_spoof_factory import create_anti_spoof
 
 
-def load_database(db_path: str, expected_embedder: str = "dlib") -> Tuple[List[List[float]], List[str]]:
+def load_database(db_path: str, expected_embedder: str = "dlib",
+                  allow_empty: bool = False) -> Tuple[List[List[float]], List[str]]:
     """
     Load face database from pickle file
 
@@ -57,7 +58,10 @@ def load_database(db_path: str, expected_embedder: str = "dlib") -> Tuple[List[L
         if not isinstance(db, EncodingsDB):
             raise ValueError("Invalid database format")
 
-        if len(db.encodings) == 0:
+        # An empty DB is fatal for the offline CLI (nothing to match against),
+        # but the kiosk must be able to boot with zero enrollments so an admin
+        # can reach the enroll page and add the first employee (allow_empty=True).
+        if len(db.encodings) == 0 and not allow_empty:
             raise ValueError("Database is empty")
 
         # Backward compatibility: old v1 databases lack these fields

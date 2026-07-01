@@ -472,6 +472,34 @@ def reconcile_recognition_state(
     return known_encodings, known_labels, len(stale)
 
 
+def _rollback_enroll_biometric(state, db_path: str, employee_name: str, photo_file) -> None:
+    """Undo the pkl / in-memory / photo writes from a partially-applied enroll.
+
+    Enrollment writes the biometric (pkl, in-memory lists, photo) BEFORE the
+    SQLite employees row, so a failed insert would otherwise strand an orphan
+    face — recognizable at the kiosk but with no employee record (the drift that
+    produced the "this face is already enrolled to <nobody>" loop). Called from
+    the insert's except-handler to restore the pre-enroll state. Best-effort:
+    every step is guarded so cleanup can't mask the original DB error.
+    """
+    try:
+        remove_encoding_from_pkl(db_path, employee_name)
+    except Exception as e:
+        print(f"[ENROLL] WARN: rollback could not purge '{employee_name}' from pkl: {e}")
+    pairs = [
+        (e, l) for e, l in zip(state.known_encodings, state.known_labels)
+        if l != employee_name
+    ]
+    if pairs:
+        state.known_encodings, state.known_labels = map(list, zip(*pairs))
+    else:
+        state.known_encodings, state.known_labels = [], []
+    try:
+        Path(photo_file).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # CLI argument parsing
 # ═══════════════════════════════════════════════════════════════════════
@@ -666,7 +694,11 @@ async def lifespan(app: FastAPI):
     # Face encodings + SQLite. Open the DB before binding the in-memory lists:
     # SQLite is the source of truth for who's deleted, so we reconcile the pkl
     # against it first (heals a delete that crashed before its pkl wipe).
-    encodings, labels = load_database(args.database, expected_embedder=args.embedder)
+    # allow_empty=True: the kiosk must boot even with zero enrollments so an
+    # admin can reach /enroll and add the first employee. (The offline CLI still
+    # errors on an empty DB — nothing to recognize against.)
+    encodings, labels = load_database(args.database, expected_embedder=args.embedder,
+                                      allow_empty=True)
     app.state.db_conn = init_kiosk_db(args.sqlite)
 
     encodings, labels, healed = reconcile_recognition_state(
@@ -1171,6 +1203,16 @@ async def _recognize_impl(request: Request, body: RecognizeRequest,
 
     # ── Step 7: Match ──
     _t = time.perf_counter()
+    # Guard the empty-DB case: with zero enrolled faces, find_best_match returns
+    # distance=inf, which is not JSON-serializable (Starlette JSONResponse uses
+    # allow_nan=False) and 500s the /api/recognize response. Short-circuit to a
+    # clean "unknown" so an empty roster degrades gracefully instead of crashing.
+    if not state.known_encodings:
+        state.pending.clear()
+        return RecognizeResponse(
+            status="unknown",
+            message="No employees enrolled.",
+        )
     label, distance, confidence = find_best_match(
         embedding, state.known_encodings, state.known_labels, state.threshold
     )
@@ -1454,17 +1496,40 @@ async def enroll(request: Request, body: EnrollRequest):
         "encoding_b64": base64.b64encode(encoding_bytes).decode("ascii"),
         "photo_b64": photo_b64,
     }
-    with state.db_conn:
-        state.db_conn.execute(
-            "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active, store_id, pos_employee_id) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET "
-            "is_active = 1, enrolled_at = excluded.enrolled_at, "
-            "photo_path = excluded.photo_path, store_id = excluded.store_id, "
-            "pos_employee_id = excluded.pos_employee_id",
-            (employee_name, f"{first} {last}", ts, str(photo_file), state.store_id, pos_id),
+    # The biometric writes above (pkl, in-memory, photo) already landed. If this
+    # insert fails — most likely the store+POS uniqueness index, which also
+    # counts soft-deleted rows the active-only pre-check above can miss — roll
+    # those writes back so we don't strand an orphan face, and return a clean
+    # error instead of a raw 500.
+    try:
+        with state.db_conn:
+            state.db_conn.execute(
+                "INSERT INTO employees (id, name, enrolled_at, photo_path, is_active, store_id, pos_employee_id) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "is_active = 1, enrolled_at = excluded.enrolled_at, "
+                "photo_path = excluded.photo_path, store_id = excluded.store_id, "
+                "pos_employee_id = excluded.pos_employee_id",
+                (employee_name, f"{first} {last}", ts, str(photo_file), state.store_id, pos_id),
+            )
+            _enqueue_outbox(state.db_conn, "enrollment", enrollment_payload, ts)
+    except sqlite3.IntegrityError as e:
+        _rollback_enroll_biometric(state, args.database, employee_name, photo_file)
+        print(f"[ENROLL] {employee_name} FAILED (integrity) and rolled back: {e}")
+        msg = (
+            f"POS Employee ID '{pos_id}' is already in use — enrollment cancelled."
+            if "pos_employee_id" in str(e)
+            else f"Database conflict — enrollment cancelled: {e}"
         )
-        _enqueue_outbox(state.db_conn, "enrollment", enrollment_payload, ts)
+        return EnrollResponse(status="error", message=msg, employee_name=employee_name)
+    except Exception as e:
+        _rollback_enroll_biometric(state, args.database, employee_name, photo_file)
+        print(f"[ENROLL] {employee_name} FAILED and rolled back: {e}")
+        return EnrollResponse(
+            status="error",
+            message=f"Could not save enrollment — cancelled and rolled back: {e}",
+            employee_name=employee_name,
+        )
 
     print(f"[ENROLL] {employee_name} enrolled successfully")
     return EnrollResponse(
