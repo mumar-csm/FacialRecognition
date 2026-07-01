@@ -67,10 +67,21 @@ Interval/batch flags (`--sync-interval-seconds`, `--sync-batch-size`,
 production defaults (1800s / 50). They're written to `device.json` only when you
 override them.
 
-**Permissions:** `secrets.env` is written mode 600 owned by whoever ran the
-command (root, under `sudo`). The systemd unit runs as the Pi's login user, which
-must be able to read it. Either run provisioning as that user, or
-`sudo chown <user>: /etc/fr-kiosk/secrets.env` afterward.
+**Permissions — hand the secret to the service user:** `secrets.env` is written
+mode 600 (owner-read only) owned by whoever ran the command. Under `sudo` (the
+command above) that's **root**, but the systemd unit runs as the Pi's login user
+— so without a fix the service can't read the secret and the sync worker fails to
+start. Reassign ownership to the login user (replace `pi` with the real account —
+`whoami` prints it):
+
+```bash
+sudo chown pi: /etc/fr-kiosk/secrets.env
+ls -l /etc/fr-kiosk/secrets.env   # confirm: -rw------- 1 pi pi ...
+```
+
+`device.json` is mode 644 (world-readable), so it needs no chown. If you instead
+provisioned *as* the login user (e.g. staging to a dir it already owns), the file
+is born owned correctly and you can skip this.
 
 ## Step 3 — Install + enable the server unit
 
