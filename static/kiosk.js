@@ -185,6 +185,17 @@
         });
         break;
 
+      case "low_light":
+        // Not a spoof \u2014 the face is just poorly lit / backlit. Guide, don't accuse.
+        setCaptureSpeed("normal");
+        showResult({
+          icon: "\u26A0",
+          name: "",
+          action: data.message || "Adjust your lighting and try again",
+          cardClass: "result-warning",
+        });
+        break;
+
       case "unknown":
         setCaptureSpeed("normal");
         showResult({

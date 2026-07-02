@@ -303,6 +303,11 @@
         showResult({ icon: "\u26D4", name: "", action: data.message, cardClass: "result-spoof" });
         break;
 
+      case "low_light":
+        // Not a spoof \u2014 recoverable lighting problem. Amber warning, not red.
+        showResult({ icon: "\u26A0", name: "", action: data.message, cardClass: "result-warning" });
+        break;
+
       case "duplicate_face":
         // Same physical face already belongs to an active employee. Hard stop \u2014
         // flash a prominent red error and keep the form filled so the manager

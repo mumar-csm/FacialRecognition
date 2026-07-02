@@ -500,6 +500,80 @@ def _rollback_enroll_biometric(state, db_path: str, employee_name: str, photo_fi
         pass
 
 
+# ── Anti-spoof input conditioning + lighting quality gate ──────────────────
+# Backlit / white-background faces get underexposed by camera auto-exposure and
+# read as spoofs to MiniFAS. We normalize the crop's illumination before the
+# check, and — when a face is still rejected but the crop is genuinely poorly lit
+# — report it as a recoverable lighting problem rather than a presentation attack.
+FACE_LUMA_MIN = 60.0      # mean luma below this = underexposed face
+FACE_LUMA_MAX = 225.0     # mean luma above this = blown-out face
+FACE_CONTRAST_MIN = 18.0  # std below this = flat / washed-out crop
+SPOOF_CROP_INSET = 0.12   # trim each bbox side toward center before MiniFAS
+
+
+def _inset_bbox(x: int, y: int, w: int, h: int, frac: float, shape) -> Tuple[int, int, int, int]:
+    """Shrink a bbox toward its center by `frac` per side, clamped to the frame.
+
+    Drops the bright background corners a raw detector bbox includes (which
+    MiniFAS can mistake for a screen bezel) without switching to full ArcFace
+    alignment, whose tighter crop scale the model was not tuned on.
+    """
+    dx, dy = int(w * frac), int(h * frac)
+    nx, ny, nw, nh = x + dx, y + dy, w - 2 * dx, h - 2 * dy
+    if nw <= 0 or nh <= 0:
+        return x, y, w, h  # degenerate — fall back to the original bbox
+    H, W = shape[:2]
+    nx, ny = max(0, nx), max(0, ny)
+    return nx, ny, min(nw, W - nx), min(nh, H - ny)
+
+
+def normalize_face_illumination(crop_rgb: np.ndarray) -> np.ndarray:
+    """CLAHE on the luma channel to restore contrast/exposure on a dark face.
+
+    Applied only to the MiniFAS input — recognition embeds the separately-aligned
+    crop, so this cannot affect match accuracy.
+    """
+    if crop_rgb.size == 0:
+        return crop_rgb
+    y, cr, cb = cv2.split(cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2YCrCb))
+    y = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(y)
+    return cv2.cvtColor(cv2.merge((y, cr, cb)), cv2.COLOR_YCrCb2RGB)
+
+
+def assess_face_lighting(crop_rgb: np.ndarray) -> Tuple[bool, str]:
+    """Judge whether a raw face crop is well-enough exposed to trust a spoof
+    verdict. Runs on the un-normalized crop so it reflects the true capture.
+    Returns (ok, reason); reason is empty when ok.
+    """
+    if crop_rgb.size == 0:
+        return True, ""
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    mean, std = float(np.mean(gray)), float(np.std(gray))
+    if mean < FACE_LUMA_MIN:
+        return False, "too_dark"
+    if mean > FACE_LUMA_MAX:
+        return False, "too_bright"
+    if std < FACE_CONTRAST_MIN:
+        return False, "low_contrast"
+    return True, ""
+
+
+def evaluate_anti_spoof(state, frame_rgb: np.ndarray, bbox) -> Tuple[bool, float, bool]:
+    """Run MiniFAS on an illumination-normalized, background-trimmed face crop.
+
+    Returns (is_real, score, lighting_ok). lighting_ok is only meaningful when
+    is_real is False: it tells the caller whether the rejection is likely a
+    lighting problem (recoverable — guide the user) vs a genuine spoof.
+    """
+    x, y, w, h = _inset_bbox(*bbox, SPOOF_CROP_INSET, frame_rgb.shape)
+    raw = frame_rgb[y:y+h, x:x+w]
+    if raw.size == 0:
+        return True, 1.0, True  # nothing to judge — don't block on an empty crop
+    is_real, score = state.anti_spoof.check(normalize_face_illumination(raw))
+    lighting_ok = True if is_real else assess_face_lighting(raw)[0]
+    return is_real, score, lighting_ok
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # CLI argument parsing
 # ═══════════════════════════════════════════════════════════════════════
@@ -825,7 +899,7 @@ class EnrollRequest(BaseModel):
 
 
 class EnrollResponse(BaseModel):
-    status: str  # enrolled, unauthorized, no_face, multiple_faces, spoof_detected, duplicate_face, error
+    status: str  # enrolled, unauthorized, no_face, multiple_faces, spoof_detected, low_light, duplicate_face, error
     message: str = ""
     employee_name: str = ""  # stored as firstname_lastname (or firstname_lastname_2 on collision)
 
@@ -840,7 +914,7 @@ class RecognizeRequest(BaseModel):
 
 
 class RecognizeResponse(BaseModel):
-    status: str  # recognized, verifying, liveness_challenge, no_face, multiple_faces, spoof_detected, unknown, cooldown
+    status: str  # recognized, verifying, liveness_challenge, no_face, multiple_faces, spoof_detected, low_light, unknown, cooldown
     identity: Optional[str] = None
     distance: Optional[float] = None
     is_clock_in: Optional[bool] = None
@@ -1156,10 +1230,23 @@ async def _recognize_impl(request: Request, body: RecognizeRequest,
         face_crop = frame_rgb[y:y+h, x:x+w]
         if face_crop.size > 0:
             _t = time.perf_counter()
-            is_real, spoof_score = state.anti_spoof.check(face_crop)
+            is_real, spoof_score, lighting_ok = evaluate_anti_spoof(
+                state, frame_rgb, (x, y, w, h)
+            )
             timings["spoof"] = (time.perf_counter() - _t) * 1000
-            print(f"[ANTI-SPOOF] is_real={is_real}, score={spoof_score:.4f}")
+            print(f"[ANTI-SPOOF] is_real={is_real}, score={spoof_score:.4f}, "
+                  f"lighting_ok={lighting_ok}")
             if not is_real:
+                # A rejection on a poorly-lit face is almost always the backlight/
+                # underexposure false-reject, not an attack. Guide the user to fix
+                # lighting instead of accusing them — and never record it as a
+                # spoof attempt or advance the spoof streak.
+                if not lighting_ok:
+                    state.spoof_streak = 0
+                    return RecognizeResponse(
+                        status="low_light",
+                        message="Move so the light is on your face, not behind you.",
+                    )
                 # Debounce: a single borderline dip shouldn't kill consensus.
                 # Require 2 consecutive spoof-positive frames before aborting —
                 # real attacks score low consistently, real faces only flicker.
@@ -1381,8 +1468,18 @@ async def enroll(request: Request, body: EnrollRequest):
     if state.anti_spoof is not None:
         face_crop = frame_rgb[y:y+h, x:x+w]
         if face_crop.size > 0:
-            is_real, spoof_score = state.anti_spoof.check(face_crop)
+            is_real, spoof_score, lighting_ok = evaluate_anti_spoof(
+                state, frame_rgb, (x, y, w, h)
+            )
             if not is_real:
+                if not lighting_ok:
+                    # Recoverable lighting problem, not a spoof — guide the user
+                    # instead of accusing them of presenting a fake face.
+                    return EnrollResponse(
+                        status="low_light",
+                        message="Move so the light is on your face, not behind you.",
+                        employee_name=employee_name,
+                    )
                 return EnrollResponse(
                     status="spoof_detected",
                     message="Liveness check failed — use your real face.",
