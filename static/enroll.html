@@ -80,6 +80,30 @@
       display: none;
     }
 
+    .pose-prompt {
+      position: absolute;
+      top: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 18px;
+      font-weight: 700;
+      color: #fff;
+      background: rgba(59, 130, 246, 0.9);
+      padding: 10px 22px;
+      border-radius: 10px;
+      text-align: center;
+      pointer-events: none;
+      z-index: 11;
+    }
+
+    .pose-prompt.pose-ok {
+      background: rgba(34, 197, 94, 0.92);
+    }
+
+    .pose-prompt.hidden {
+      display: none;
+    }
+
     .back-link {
       color: #94a3b8;
       text-decoration: none;
@@ -177,6 +201,7 @@
       <canvas id="snapshot" style="display:none;"></canvas>
       <div class="camera-overlay">
         <div class="face-guide"></div>
+        <div id="pose-prompt" class="pose-prompt hidden"></div>
         <div id="lighting-warning" class="lighting-warning hidden"></div>
       </div>
     </div>
@@ -211,6 +236,6 @@
     </div>
   </div>
 
-  <script src="/static/enroll.js?v=5"></script>
+  <script src="/static/enroll.js?v=6"></script>
 </body>
 </html>

@@ -35,6 +35,7 @@
   var resultName = document.getElementById("result-name");
   var resultAction = document.getElementById("result-action");
   var lightingWarning = document.getElementById("lighting-warning");
+  var posePrompt = document.getElementById("pose-prompt");
   var nameHint = document.getElementById("name-hint");
   var statusDot = document.getElementById("status-dot");
   var statusText = document.getElementById("status-text");
@@ -45,8 +46,21 @@
   var BRIGHTNESS_MIN = 50;
   var BRIGHTNESS_MAX = 220;
 
+  // Multi-angle capture: prompt each pose, hold briefly so the user can
+  // reposition, then auto-snap one frame. frames[0] is the frontal shot.
+  var POSES = [
+    { label: "Look STRAIGHT AHEAD" },
+    { label: "Turn your head slightly LEFT" },
+    { label: "Turn your head slightly RIGHT" },
+  ];
+  var POSE_HOLD_MS = 1500;          // reposition time before the auto-snap
+  var POSE_GAP_MS = 600;            // pause after a shot before the next pose
+  var LIGHTING_WAIT_MS = 200;       // poll interval while waiting for good light
+  var LIGHTING_WAIT_MAX_MS = 6000;  // give up waiting for light after this
+
   var cameraReady = false;
   var lightingOk = true;
+  var capturing = false;            // true while a pose sequence is running
 
   // ── Server config (store label) ──
   async function loadServerConfig() {
@@ -215,12 +229,70 @@
       nameHint.className = "name-hint hidden";
     }
 
-    enrollBtn.disabled = !cameraReady || !lightingOk || !hasName || !posIdOk;
+    enrollBtn.disabled = capturing || !cameraReady || !lightingOk || !hasName || !posIdOk;
   }
 
   firstNameInput.addEventListener("input", updateButtonState);
   lastNameInput.addEventListener("input", updateButtonState);
   posIdInput.addEventListener("input", updateButtonState);
+
+  // ── Capture helpers ──
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function captureFrame() {
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
+  }
+
+  function showPose(text, cls) {
+    if (!posePrompt) return;
+    posePrompt.textContent = text;
+    posePrompt.className = "pose-prompt" + (cls ? " " + cls : "");
+  }
+
+  function hidePose() {
+    if (posePrompt) posePrompt.className = "pose-prompt hidden";
+  }
+
+  // Block the snap until lighting is acceptable (or we give up).
+  async function waitForLighting() {
+    var waited = 0;
+    while (!lightingOk && waited < LIGHTING_WAIT_MAX_MS) {
+      await sleep(LIGHTING_WAIT_MS);
+      waited += LIGHTING_WAIT_MS;
+    }
+    return lightingOk;
+  }
+
+  // Walk the user through each pose and collect one frame per pose.
+  // Returns { frames: [...] } or { aborted: true, reason } on lighting timeout.
+  async function runCaptureSequence() {
+    var frames = [];
+    for (var i = 0; i < POSES.length; i++) {
+      var stepLabel = "Step " + (i + 1) + "/" + POSES.length + " — " + POSES[i].label;
+      setStatus("scanning", stepLabel);
+
+      // Countdown while the user gets into position.
+      var ticks = Math.max(1, Math.round(POSE_HOLD_MS / 500));
+      for (var t = ticks; t > 0; t--) {
+        showPose(stepLabel + "  (" + t + ")");
+        await sleep(500);
+      }
+
+      if (!(await waitForLighting())) {
+        hidePose();
+        return { aborted: true, reason: "lighting" };
+      }
+
+      frames.push(captureFrame());
+      showPose("Captured ✓", "pose-ok");
+      await sleep(POSE_GAP_MS);
+    }
+    hidePose();
+    return { frames: frames };
+  }
 
   // ── Enroll ──
   enrollBtn.addEventListener("click", async function () {
@@ -237,21 +309,27 @@
       return;
     }
 
+    capturing = true;
     enrollBtn.disabled = true;
-    enrollBtn.textContent = "Processing...";
-    setStatus("scanning", "Capturing and enrolling...");
-
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    var dataUrl = canvas.toDataURL("image/jpeg", 0.85);
-    var base64Data = dataUrl.split(",")[1];
+    enrollBtn.textContent = "Capturing...";
 
     try {
+      var seq = await runCaptureSequence();
+      if (seq.aborted) {
+        showResult({ icon: "\u26a0", name: "", action: "Lighting isn't good enough \u2014 try again.", cardClass: "result-warning" });
+        setStatus("idle", "Ready \u2014 enter name and capture");
+        return;
+      }
+
+      enrollBtn.textContent = "Enrolling...";
+      setStatus("scanning", "Enrolling...");
+
       var pinValue = cachedPin || getCachedPin();
       var resp = await fetch("/api/enroll", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          image: base64Data,
+          images: seq.frames,
           first_name: firstName,
           last_name: lastName,
           pos_employee_id: posId,
@@ -262,10 +340,12 @@
       handleResult(data);
     } catch (err) {
       showResult({ icon: "\u2716", name: "", action: "Server error: " + err.message, cardClass: "result-spoof" });
+    } finally {
+      hidePose();
+      capturing = false;
+      enrollBtn.textContent = "Capture & Enroll";
+      updateButtonState();
     }
-
-    enrollBtn.textContent = "Capture & Enroll";
-    updateButtonState();
   });
 
   // ── Handle result ──

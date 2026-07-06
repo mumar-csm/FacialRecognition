@@ -66,6 +66,23 @@ def upsert(path: str, label: str, embedding: np.ndarray, source: str) -> None:
     save(path, db)
 
 
+def upsert_many(path: str, label: str, embeddings, source: str) -> None:
+    """Replace any existing entries for `label`, then append several fresh ones.
+
+    Multi-angle enrollment stores N encodings (e.g. center/left/right) under one
+    label; the recognizer already takes the min distance across all of them, so
+    each is just another row in the parallel lists. Drop-then-append-all keeps the
+    whole set replaced atomically (one save), matching upsert()'s idempotency.
+    """
+    db = load(path)
+    _drop(db, label)
+    for embedding in embeddings:
+        db.encodings.append(np.asarray(embedding).tolist())
+        db.labels.append(label)
+        db.meta.append({"source": source, "label": label})
+    save(path, db)
+
+
 def remove(path: str, label: str) -> None:
     """Drop all entries for `label` from the pkl (no-op if absent)."""
     db = load(path)

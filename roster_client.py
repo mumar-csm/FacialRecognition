@@ -244,12 +244,24 @@ class RosterClient:
 
         embedding = np.frombuffer(base64.b64decode(encoding_b64), dtype=np.float32)
 
-        # 1) pkl on disk (atomic) — recognition substrate.
-        pkl_store.upsert(self.pkl_path, employee_id, embedding, source="roster_sync")
+        # Multi-angle clobber guard: central currently carries only ONE encoding
+        # per employee, but a local enrollment may hold several (center/left/right)
+        # under this label. Overwriting drop-then-append-single would collapse that
+        # set to one, silently degrading recognition. So when the local set already
+        # has >1 encoding for this label, skip the biometric overwrite and apply
+        # metadata only. (Becomes a no-op once upstream sync carries all angles —
+        # central will then echo the full set. See [[project-step-2b-roster]].)
+        local_count = sum(1 for l in self.app.state.known_labels if l == employee_id)
+        if local_count > 1:
+            print(f"[ROSTER] {employee_id!r} has {local_count} local encodings "
+                  f"(multi-angle) — applying metadata only, keeping local biometric")
+        else:
+            # 1) pkl on disk (atomic) — recognition substrate.
+            pkl_store.upsert(self.pkl_path, employee_id, embedding, source="roster_sync")
 
-        # 2) in-memory lists — single atomic reassignment, no await in between,
-        #    so a concurrent /api/recognize sees old-or-new, never half.
-        self._memory_upsert(employee_id, embedding)
+            # 2) in-memory lists — single atomic reassignment, no await in between,
+            #    so a concurrent /api/recognize sees old-or-new, never half.
+            self._memory_upsert(employee_id, embedding)
 
         # 3) local employees row — keep display_name / store_id / active in step.
         with conn:

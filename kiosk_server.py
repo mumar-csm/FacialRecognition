@@ -42,7 +42,11 @@ from detector_factory import FaceDetector, align_face, create_detector
 from embedding_factory import create_embedder
 from euclideanDist import euclidean_distance
 from liveness import LivenessManager, SessionState
-from pkl_store import remove as remove_encoding_from_pkl, upsert as upsert_encoding_to_pkl
+from pkl_store import (
+    remove as remove_encoding_from_pkl,
+    upsert as upsert_encoding_to_pkl,
+    upsert_many as upsert_encodings_to_pkl,
+)
 from recognize import find_best_match, load_database
 from sync_worker import SyncWorker
 from roster_client import RosterClient
@@ -891,7 +895,11 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # ═══════════════════════════════════════════════════════════════════════
 
 class EnrollRequest(BaseModel):
-    image: str        # base64-encoded JPEG (with or without data URI prefix)
+    # Multi-angle enrollment sends several poses in `images` (center/left/right).
+    # `image` is kept for single-frame back-compat; exactly one of the two is used
+    # (images wins). Each frame becomes one stored encoding under the same label.
+    image: Optional[str] = None    # base64 JPEG (with or without data URI prefix)
+    images: Optional[List[str]] = None  # base64 JPEG frames, frontal first
     first_name: str
     last_name: str
     pos_employee_id: str   # Oracle POS employee identifier — used to map punches
@@ -1437,70 +1445,93 @@ async def enroll(request: Request, body: EnrollRequest):
             employee_name = f"{base_name}_{suffix}"
             suffix += 1
 
-    # ── Decode image ──
-    try:
-        image_data = body.image
-        if "," in image_data and image_data.index(",") < 100:
-            image_data = image_data.split(",", 1)[1]
-        raw_bytes = base64.b64decode(image_data)
-        np_arr = np.frombuffer(raw_bytes, np.uint8)
-        frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if frame_bgr is None:
-            return EnrollResponse(status="error", message="Failed to decode image.", employee_name=employee_name)
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    except Exception as e:
-        return EnrollResponse(status="error", message=f"Image decode failed: {e}", employee_name=employee_name)
+    # ── Process each captured frame into an encoding ──
+    # Multi-angle enrollment: the client sends several poses (center/left/right).
+    # Every frame must independently pass detect + anti-spoof; each yields one
+    # encoding stored under the same label. The recognizer matches against the
+    # closest of them, so an off-angle probe still lands. frames[0] is the frontal
+    # shot — it drives the duplicate check, the display photo, and the upstream
+    # sync payload. A failed pose returns a status naming which shot to retake.
+    frames = body.images if body.images else ([body.image] if body.image else [])
+    if not frames:
+        return EnrollResponse(status="error", message="No image provided.", employee_name=employee_name)
 
-    # ── Detect face ──
-    detections = state.detector.detect(frame_rgb)
-    if len(detections) == 0:
-        return EnrollResponse(status="no_face", message="No face detected — try again.", employee_name=employee_name)
-    if len(detections) > 1:
-        return EnrollResponse(
-            status="multiple_faces",
-            message="Multiple faces detected — only you should be in frame.",
-            employee_name=employee_name,
-        )
+    POSE_LABELS = ["straight-ahead", "left-turn", "right-turn"]
 
-    (x, y, w, h), landmarks = detections[0]
+    def _pose_name(i: int) -> str:
+        return POSE_LABELS[i] if i < len(POSE_LABELS) else f"frame {i + 1}"
 
-    # ── Anti-spoof check ──
-    if state.anti_spoof is not None:
-        face_crop = frame_rgb[y:y+h, x:x+w]
-        if face_crop.size > 0:
-            is_real, spoof_score, lighting_ok = evaluate_anti_spoof(
-                state, frame_rgb, (x, y, w, h)
-            )
-            if not is_real:
-                if not lighting_ok:
-                    # Recoverable lighting problem, not a spoof — guide the user
-                    # instead of accusing them of presenting a fake face.
-                    return EnrollResponse(
-                        status="low_light",
-                        message="Move so the light is on your face, not behind you.",
-                        employee_name=employee_name,
-                    )
-                return EnrollResponse(
-                    status="spoof_detected",
-                    message="Liveness check failed — use your real face.",
-                    employee_name=employee_name,
+    def _process_frame(image_data: str, pose: str):
+        """Decode → detect → anti-spoof → align → embed one frame.
+
+        Returns (embedding, frame_bgr, None) on success, or
+        (None, None, EnrollResponse) carrying the failure status.
+        """
+        # Decode
+        try:
+            data = image_data
+            if "," in data and data.index(",") < 100:
+                data = data.split(",", 1)[1]
+            raw_bytes = base64.b64decode(data)
+            np_arr = np.frombuffer(raw_bytes, np.uint8)
+            frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            if frame_bgr is None:
+                return None, None, EnrollResponse(status="error", message=f"Failed to decode the {pose} shot.", employee_name=employee_name)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            return None, None, EnrollResponse(status="error", message=f"Image decode failed ({pose}): {e}", employee_name=employee_name)
+
+        # Detect (exactly one face)
+        detections = state.detector.detect(frame_rgb)
+        if len(detections) == 0:
+            return None, None, EnrollResponse(status="no_face", message=f"No face detected on the {pose} shot — retake it.", employee_name=employee_name)
+        if len(detections) > 1:
+            return None, None, EnrollResponse(status="multiple_faces", message=f"Multiple faces on the {pose} shot — only you should be in frame.", employee_name=employee_name)
+
+        (x, y, w, h), landmarks = detections[0]
+
+        # Anti-spoof
+        if state.anti_spoof is not None:
+            face_crop = frame_rgb[y:y+h, x:x+w]
+            if face_crop.size > 0:
+                is_real, spoof_score, lighting_ok = evaluate_anti_spoof(
+                    state, frame_rgb, (x, y, w, h)
                 )
+                if not is_real:
+                    if not lighting_ok:
+                        # Recoverable lighting problem, not a spoof — guide the user.
+                        return None, None, EnrollResponse(status="low_light", message=f"Move so the light is on your face for the {pose} shot.", employee_name=employee_name)
+                    return None, None, EnrollResponse(status="spoof_detected", message="Liveness check failed — use your real face.", employee_name=employee_name)
 
-    # ── Align face ──
-    if state.do_align and landmarks is not None:
-        aligned = align_face(frame_rgb, landmarks, 112)
-        aligned = np.ascontiguousarray(aligned)
-    else:
-        face_roi = frame_rgb[y:y+h, x:x+w]
-        aligned = np.ascontiguousarray(face_roi) if face_roi.size > 0 else None
+        # Align
+        if state.do_align and landmarks is not None:
+            aligned = align_face(frame_rgb, landmarks, 112)
+            aligned = np.ascontiguousarray(aligned)
+        else:
+            face_roi = frame_rgb[y:y+h, x:x+w]
+            aligned = np.ascontiguousarray(face_roi) if face_roi.size > 0 else None
+        if aligned is None:
+            return None, None, EnrollResponse(status="error", message=f"Face alignment failed on the {pose} shot.", employee_name=employee_name)
 
-    if aligned is None:
-        return EnrollResponse(status="error", message="Face alignment failed.", employee_name=employee_name)
+        # Embed
+        embedding = state.embedder.embed(aligned)
+        if embedding is None:
+            return None, None, EnrollResponse(status="error", message=f"Embedding failed on the {pose} shot.", employee_name=employee_name)
 
-    # ── Embed ──
-    embedding = state.embedder.embed(aligned)
-    if embedding is None:
-        return EnrollResponse(status="error", message="Embedding extraction failed.", employee_name=employee_name)
+        return embedding, frame_bgr, None
+
+    embeddings = []
+    frame_bgr = None  # frontal frame — used for the display photo + outbox below
+    for i, img in enumerate(frames):
+        emb, fbgr, err = _process_frame(img, _pose_name(i))
+        if err is not None:
+            return err
+        embeddings.append(emb)
+        if frame_bgr is None:
+            frame_bgr = fbgr
+
+    # Frontal encoding drives the duplicate check and the upstream sync payload.
+    embedding = embeddings[0]
 
     # ── Duplicate-face guard ──
     # Reject enrolling a face that already belongs to a different active
@@ -1562,7 +1593,7 @@ async def enroll(request: Request, body: EnrollRequest):
     # endpoint, but if a label ever does recur the old encoding is replaced
     # instead of accumulating as a stale duplicate.
     try:
-        upsert_encoding_to_pkl(args.database, employee_name, embedding, source="kiosk_enrollment")
+        upsert_encodings_to_pkl(args.database, employee_name, embeddings, source="kiosk_enrollment")
     except Exception as e:
         return EnrollResponse(status="error", message=f"Failed to save encoding: {e}", employee_name=employee_name)
 
@@ -1572,9 +1603,10 @@ async def enroll(request: Request, body: EnrollRequest):
     photo_file = employees_dir / f"{employee_name}.jpg"
     cv2.imwrite(str(photo_file), frame_bgr)
 
-    # ── Hot-reload in-memory ──
-    state.known_encodings.append(embedding.tolist())
-    state.known_labels.append(employee_name)
+    # ── Hot-reload in-memory (all angles under one label) ──
+    for emb in embeddings:
+        state.known_encodings.append(np.asarray(emb).tolist())
+        state.known_labels.append(employee_name)
 
     # ── Insert into employees table + queue enrollment event for central ──
     ts = datetime.now(timezone.utc).isoformat()
