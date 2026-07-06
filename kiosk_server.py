@@ -1461,11 +1461,17 @@ async def enroll(request: Request, body: EnrollRequest):
     def _pose_name(i: int) -> str:
         return POSE_LABELS[i] if i < len(POSE_LABELS) else f"frame {i + 1}"
 
-    def _process_frame(image_data: str, pose: str):
-        """Decode → detect → anti-spoof → align → embed one frame.
+    def _process_frame(image_data: str, pose: str, check_spoof: bool):
+        """Decode → detect → (anti-spoof) → align → embed one frame.
 
         Returns (embedding, frame_bgr, None) on success, or
         (None, None, EnrollResponse) carrying the failure status.
+
+        check_spoof gates MiniFAS: we only run it on the frontal shot. The
+        off-angle poses are exactly where MiniFAS (frontal-trained) sags below
+        threshold on genuine faces, and since every frame is AND-ed together a
+        single off-angle misfire would abort the whole (PIN-gated) enrollment.
+        The blink challenge at clock-in remains the real liveness gate.
         """
         # Decode
         try:
@@ -1490,8 +1496,8 @@ async def enroll(request: Request, body: EnrollRequest):
 
         (x, y, w, h), landmarks = detections[0]
 
-        # Anti-spoof
-        if state.anti_spoof is not None:
+        # Anti-spoof (frontal shot only — see docstring)
+        if check_spoof and state.anti_spoof is not None:
             face_crop = frame_rgb[y:y+h, x:x+w]
             if face_crop.size > 0:
                 is_real, spoof_score, lighting_ok = evaluate_anti_spoof(
@@ -1523,7 +1529,7 @@ async def enroll(request: Request, body: EnrollRequest):
     embeddings = []
     frame_bgr = None  # frontal frame — used for the display photo + outbox below
     for i, img in enumerate(frames):
-        emb, fbgr, err = _process_frame(img, _pose_name(i))
+        emb, fbgr, err = _process_frame(img, _pose_name(i), check_spoof=(i == 0))
         if err is not None:
             return err
         embeddings.append(emb)
