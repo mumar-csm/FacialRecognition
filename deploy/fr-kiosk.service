@@ -33,9 +33,14 @@ EnvironmentFile=/etc/fr-kiosk/secrets.env
 # device.json supplies device_id / store_id / central_url / intervals.
 # Bind stays the loopback default (127.0.0.1:8000): the API is reachable only
 # from this Pi, which is all the local Chromium kiosk needs.
+# --detector scrfd is the server default too, but stated here so the deploy is
+# self-documenting: it's what keeps blink liveness usable on the Pi (SCRFD via
+# model_zoo skips the FaceAnalysis aux models; ~1000ms -> ~135ms detect). The
+# model path defaults to the buffalo_l det_10g.onnx already present for ArcFace.
 ExecStart=/opt/fr-kiosk/venv/bin/python kiosk_server.py \
     --device-config /etc/fr-kiosk/device.json \
-    --database data/known_faces_arcface.pkl
+    --database data/known_faces_arcface.pkl \
+    --detector scrfd
 
 Restart=on-failure
 RestartSec=5

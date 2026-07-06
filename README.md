@@ -307,14 +307,15 @@ python kiosk_server.py --database data/known_faces_arcface.pkl --threshold 0.75
 python kiosk_server.py --database data/known_faces_arcface.pkl --spoof-threshold 0.7
 ```
 
-**Faster pipeline on weak hardware (e.g. Raspberry Pi) — recommended Pi config**
+**Faster pipeline on weak hardware (e.g. Raspberry Pi)**
 
-Use `--detector scrfd` and shrink the detector input size. `scrfd` is the **same** detection network as the default `retinaface`, but loaded directly — it skips the `FaceAnalysis` auxiliary models (106-point landmarks, 3D landmarks, gender/age) that run every frame and the kiosk never uses, so it's faster with no loss of accuracy or landmark quality. `--det-size 320` is the default; 256 or 224 trades a little accuracy for more speed:
+`scrfd` is now the **default** detector. It's the same detection network as `retinaface` but loaded directly — it skips the `FaceAnalysis` auxiliary models (106-point landmarks, 3D landmarks, gender/age) that ran every frame and the kiosk never uses, with no loss of accuracy or landmark quality. On a Raspberry Pi that cut detection from ~1000 ms to ~135 ms per frame (~1 FPS → ~7 FPS) — which is what makes the blink liveness challenge register a normal-speed blink instead of requiring an exaggerated one. `--det-size 320` is the default; 256 or 224 trades a little accuracy for more speed:
 ```bash
-python kiosk_server.py --database data/known_faces_arcface.pkl --detector scrfd
+# scrfd is already the default; shrink the detector input for even more speed
+python kiosk_server.py --database data/known_faces_arcface.pkl --det-size 256
 ```
 
-> `scrfd` expects the buffalo_l model already on disk (`~/.insightface/models/buffalo_l/det_10g.onnx`) and errors if it's missing. It's present once you've built the ArcFace database (Step 2 downloads it). The default `retinaface` auto-downloads buffalo_l on first run, which is why it stays the safe out-of-box default — but on a Pi or in production, `scrfd` is the better choice.
+> `scrfd` expects the buffalo_l model on disk (`~/.insightface/models/buffalo_l/det_10g.onnx`) and errors if it's missing — but it's present once you've built the ArcFace database (Step 2 downloads it), which the kiosk requires anyway. On a fresh machine without it, `--detector retinaface` auto-downloads buffalo_l on first run.
 
 **Manager-PIN-gated enrollment**
 
@@ -362,7 +363,7 @@ python kiosk_server.py --database data/known_faces_arcface.pkl \
 | `--spoof-threshold` | Anti-spoof "real" probability cutoff (higher = stricter) | `0.55` |
 | `--challenge-timeout` | Seconds allowed for the blink challenge | `8.0` |
 | `--anti-spoof` | Anti-spoof backend: `minifas`, `none` | `minifas` |
-| `--detector` | Detection backend: `retinaface`, `scrfd`, `haar`. `scrfd` is the same model as `retinaface` with less overhead — recommended on a Pi (see above) | `retinaface` |
+| `--detector` | Detection backend: `scrfd`, `retinaface`, `haar`. `scrfd` (default) is the same model as `retinaface` with less overhead (see above); `retinaface` auto-downloads buffalo_l on a fresh machine | `scrfd` |
 | `--det-size` | Detector input size (smaller = faster) | `320` |
 | `--embedder` | Embedding backend: `arcface`, `dlib` | `arcface` |
 | `--enrollment-pin` | Manager PIN to gate enroll/delete | None |

@@ -588,7 +588,13 @@ def parse_args():
                    help="Path to face encodings pkl file")
     p.add_argument("--sqlite", default="data/kiosk.db",
                    help="Path to SQLite database")
-    p.add_argument("--detector", choices=["haar", "retinaface", "scrfd"], default="retinaface")
+    # scrfd is the default: it loads the same SCRFD det_10g model as retinaface
+    # but directly via model_zoo, skipping the insightface FaceAnalysis aux models
+    # (2d106det/1k3d68/genderage) that ran on every frame. On the Pi that cut
+    # detection ~1000ms -> ~135ms (~1 FPS -> ~7 FPS), which is what let normal-
+    # speed blinks register. Same model file (already present via buffalo_l), so
+    # accuracy and existing arcface encodings are unaffected.
+    p.add_argument("--detector", choices=["haar", "retinaface", "scrfd"], default="scrfd")
     p.add_argument("--scrfd-model",
                    default="~/.insightface/models/buffalo_l/det_10g.onnx",
                    dest="scrfd_model",
