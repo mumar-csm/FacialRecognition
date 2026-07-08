@@ -41,6 +41,50 @@
   setInterval(updateClock, 1000);
   updateClock();
 
+  // ── Camera lock (Stage 0: pin exposure/WB so auto-exposure can't over-brighten
+  //     the face crop and trigger MiniFAS false spoofs) ──
+  //
+  // Browser-side belt on top of the OS-level v4l2 lock (deploy/lock_camera.sh).
+  // Fill KIOSK_CAM with the calibrated values (same numbers as camera.env) to
+  // pin them here too; leave null to only log capabilities for calibration.
+  // Harmless on Firefox: unsupported advanced constraints are silently ignored.
+  const KIOSK_CAM = {
+    exposureTime: null,        // e.g. 156  (manual exposure; camera-specific units)
+    colorTemperature: null,    // e.g. 4600 (Kelvin, for manual white balance)
+  };
+
+  async function lockCameraConstraints(stream) {
+    try {
+      const track = stream.getVideoTracks()[0];
+      if (!track) return;
+      const caps =
+        typeof track.getCapabilities === "function" ? track.getCapabilities() : {};
+      // Log capabilities + current settings so we can read back settled AE/AWB
+      // values during per-site calibration (open the kiosk devtools console).
+      console.info("[cam] capabilities:", caps);
+      console.info("[cam] settings:", track.getSettings && track.getSettings());
+
+      const advanced = [];
+      if ("exposureMode" in caps) advanced.push({ exposureMode: "manual" });
+      if (KIOSK_CAM.exposureTime != null && "exposureTime" in caps)
+        advanced.push({ exposureTime: KIOSK_CAM.exposureTime });
+      if ("whiteBalanceMode" in caps) advanced.push({ whiteBalanceMode: "manual" });
+      if (KIOSK_CAM.colorTemperature != null && "colorTemperature" in caps)
+        advanced.push({ colorTemperature: KIOSK_CAM.colorTemperature });
+
+      if (advanced.length) {
+        await track.applyConstraints({ advanced });
+        console.info("[cam] applied manual constraints:", advanced);
+      } else {
+        console.info("[cam] no manual exposure/WB support in this browser — " +
+          "relying on OS-level v4l2 lock (deploy/lock_camera.sh)");
+      }
+    } catch (err) {
+      // Never let a constraint failure break the camera; v4l2 is the real lock.
+      console.warn("[cam] applyConstraints failed (ignored):", err);
+    }
+  }
+
   // ── Camera init ──
   async function initCamera() {
     try {
@@ -48,6 +92,7 @@
         video: { facingMode: "user", width: { ideal: 320 }, height: { ideal: 240 } },
         audio: false,
       });
+      await lockCameraConstraints(stream);
       video.srcObject = stream;
       await video.play();
       canvas.width = video.videoWidth;

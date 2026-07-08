@@ -1,0 +1,17 @@
+# fr-camera-lock.timer — re-apply the webcam lock periodically so it survives the
+# browser re-opening the camera (which can silently reset controls to auto).
+#
+# 30s is plenty: the browser only renegotiates on start/refresh, and re-issuing
+# the same v4l2 --set-ctrl values is idempotent and cheap.
+[Unit]
+Description=Periodically re-apply FR kiosk webcam exposure lock
+
+[Timer]
+# First run shortly after boot, then every 30s.
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=fr-camera-lock.service
+
+[Install]
+WantedBy=timers.target

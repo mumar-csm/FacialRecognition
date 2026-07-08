@@ -1,0 +1,28 @@
+# fr-camera-lock.service — pin the webcam's exposure/gain/WB via v4l2 (Stage 0).
+#
+# Oneshot: applies deploy/lock_camera.sh using /etc/fr-kiosk/camera.env. Paired
+# with fr-camera-lock.timer, which re-fires it periodically so the lock survives
+# the browser re-opening the camera (which can reset controls to auto).
+#
+# Install (on the Pi, as root), AFTER calibrate_camera.sh has written camera.env:
+#   sudo install -m0755 deploy/lock_camera.sh /opt/fr-kiosk/deploy/lock_camera.sh
+#   sudo cp deploy/fr-camera-lock.service /etc/systemd/system/
+#   sudo cp deploy/fr-camera-lock.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fr-camera-lock.timer
+#   systemctl status fr-camera-lock.service
+[Unit]
+Description=Lock FR kiosk webcam exposure/gain/white-balance (Stage 0)
+# Apply after the camera device exists and the kiosk browser has come up (the
+# browser can reset controls, so we want to run at/after that point too).
+After=dev-video0.device fr-kiosk-chromium.service
+Wants=dev-video0.device
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fr-kiosk/deploy/lock_camera.sh
+# camera.env holds FR_CAM_DEVICE/EXPOSURE/GAIN/WB; lock_camera.sh reads it itself.
+Environment=CAM_ENV=/etc/fr-kiosk/camera.env
+
+[Install]
+WantedBy=multi-user.target
