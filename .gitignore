@@ -28,6 +28,9 @@ debug_scripts/
 data/known_faces.pkl
 data/*.pkl
 
+# Anti-spoof capture dataset (local fine-tuning only — captured face crops + CSV)
+data/spoof_dataset/
+
 # Haar Cascade model (large file, available from OpenCV)
 data/haarcascade_frontalface_default.xml
 

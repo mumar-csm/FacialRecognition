@@ -131,6 +131,13 @@ class MiniFASChecker:
         img = img.transpose(2, 0, 1).astype(np.float32) / 255.0
         return img
 
+    def _logit_diff(self, face_image: np.ndarray) -> float:
+        """Run inference and return real_logit - spoof_logit (signed: >0 = real)."""
+        blob = self._preprocess(face_image)
+        blob = np.expand_dims(blob, axis=0)  # (1, 3, 128, 128)
+        logits = self._session.run(None, {self._input_name: blob})[0]  # (1, 2)
+        return float(logits[0][0]) - float(logits[0][1])
+
     def check(self, face_image: np.ndarray) -> Tuple[bool, float]:
         """
         Classify a face crop as real or spoof.
@@ -142,23 +149,24 @@ class MiniFASChecker:
             (is_real, confidence):
                 is_real: True if the face appears live.
                 confidence: model certainty in [0, 1], where 1.0 = very certain.
+                            NOTE: this is |logit_diff| through a sigmoid — a
+                            direction-STRIPPED magnitude. Confident-real and
+                            confident-spoof both read high. For a signed, tunable
+                            real-vs-spoof axis use probability_real().
         """
-        # Preprocess and add batch dimension
-        blob = self._preprocess(face_image)
-        blob = np.expand_dims(blob, axis=0)  # (1, 3, 128, 128)
-
-        # Run inference
-        logits = self._session.run(None, {self._input_name: blob})[0]  # (1, 2)
-        real_logit = float(logits[0][0])
-        spoof_logit = float(logits[0][1])
-
-        logit_diff = real_logit - spoof_logit
+        logit_diff = self._logit_diff(face_image)
         is_real = logit_diff >= self._logit_threshold
-
         # Convert logit diff to a 0-1 confidence via sigmoid
         confidence = 1.0 / (1.0 + np.exp(-abs(logit_diff)))
-
         return bool(is_real), float(confidence)
+
+    def probability_real(self, face_image: np.ndarray) -> float:
+        """
+        Signed P(real) in [0, 1]: near 1 = confidently real, near 0 = confidently
+        spoof, ~0.5 = unsure. Unlike check()'s confidence, this keeps direction,
+        so it's the axis to threshold/plot for real-vs-replay separation.
+        """
+        return float(1.0 / (1.0 + np.exp(-self._logit_diff(face_image))))
 
 
 # ---------------------------------------------------------------------------
