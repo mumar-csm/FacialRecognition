@@ -20,8 +20,15 @@ Pillow>=8.0.0
 insightface>=0.7.3
 onnxruntime>=1.14.0
 scikit-image>=0.19.0
+# onnx >=1.18 (pulled in by insightface) references ml_dtypes.float4_e2m1fn,
+# but pip can resolve an older ml_dtypes that lacks it -> AttributeError at
+# import. Verified working on Pi: onnx 1.19.0 + ml_dtypes 0.5.4.
+ml_dtypes>=0.5
 
 # Kiosk web server
 fastapi>=0.100.0
 uvicorn[standard]>=0.22.0
 python-multipart>=0.0.6
+
+# Central sync (sync_worker.py / roster_client.py, imported by kiosk_server.py)
+httpx>=0.25.0

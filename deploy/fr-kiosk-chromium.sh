@@ -25,6 +25,9 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 
+# --password-store=basic: skip gnome-keyring. Autologin never unlocks a keyring,
+# so without this Chromium pops a "choose password for new keyring" dialog on
+# every boot. The kiosk stores no credentials, so basic (plaintext) is fine.
 exec "${BROWSER}" \
     --kiosk \
     --noerrdialogs \
@@ -32,4 +35,5 @@ exec "${BROWSER}" \
     --disable-session-crashed-bubble \
     --disable-pinch \
     --incognito \
+    --password-store=basic \
     "${URL}"

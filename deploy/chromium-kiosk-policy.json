@@ -1,0 +1,5 @@
+{
+  "_comment": "Chromium enterprise policy for the FR kiosk. Pre-grants camera access to the local kiosk origin so the getUserMedia permission prompt never appears (incognito forgets grants on every exit). Install into BOTH possible policy dirs — the package name varies by Pi OS release: sudo mkdir -p /etc/chromium/policies/managed /etc/chromium-browser/policies/managed && sudo cp deploy/chromium-kiosk-policy.json /etc/chromium/policies/managed/fr-kiosk.json && sudo cp deploy/chromium-kiosk-policy.json /etc/chromium-browser/policies/managed/fr-kiosk.json",
+  "VideoCaptureAllowedUrls": ["http://127.0.0.1:8000"],
+  "AudioCaptureAllowed": false
+}
